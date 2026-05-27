@@ -15,7 +15,9 @@ SETTINGS_FILE="${CONFIG_DIR}/settings.conf"
 LEGACY_CONFIG_FILE="$HOME/.tg_monitor.conf"
 CRON_MARK="# tg-monitor-auto"
 LOOP_PID_FILE="${CONFIG_DIR}/monitor-loop.pid"
+LOOP_INTERVAL_FILE="${CONFIG_DIR}/monitor-loop.interval"
 CHECK_TIMEOUT="${CHECK_TIMEOUT:-3}"
+TCP_CHECK_COUNT="${TCP_CHECK_COUNT:-10}"
 ALERT_IP_LIST_LIMIT="${ALERT_IP_LIST_LIMIT:-30}"
 DOMAIN_ALERT_SIGNATURE_MODE="${DOMAIN_ALERT_SIGNATURE_MODE:-summary}"
 DEFAULT_UPDATE_BASE="https://raw.githubusercontent.com/inimemail/monitor/main"
@@ -42,7 +44,7 @@ ensure_data() {
     mkdir -p "${CONFIG_DIR}"
     touch "${TARGETS_DB}" "${BOTS_DB}" "${NOTIFIERS_DB}" "${STATES_DB}" "${SETTINGS_FILE}"
     chmod 700 "${CONFIG_DIR}" 2>/dev/null || true
-    chmod 600 "${TARGETS_DB}" "${BOTS_DB}" "${NOTIFIERS_DB}" "${STATES_DB}" "${SETTINGS_FILE}" 2>/dev/null || true
+    chmod 600 "${TARGETS_DB}" "${BOTS_DB}" "${NOTIFIERS_DB}" "${STATES_DB}" "${SETTINGS_FILE}" "${LOOP_INTERVAL_FILE}" 2>/dev/null || true
 }
 
 now_ts() {
@@ -518,7 +520,7 @@ resolve_target_ips() {
 tcp_check() {
     local host="$1"
     local port="$2"
-    local output
+    local output count
     TCP_CHECK_ERROR=""
 
     if ! command -v hping3 >/dev/null 2>&1; then
@@ -526,7 +528,10 @@ tcp_check() {
         return 2
     fi
 
-    output="$(timeout "${CHECK_TIMEOUT}" hping3 -S -p "${port}" -c 1 "${host}" 2>&1)"
+    count="${TCP_CHECK_COUNT:-10}"
+    [[ "${count}" =~ ^[0-9]+$ && "${count}" -ge 1 ]] || count=10
+
+    output="$(timeout "$((CHECK_TIMEOUT * count + 2))" hping3 -S -p "${port}" -c "${count}" "${host}" 2>&1)"
     if printf '%s\n' "${output}" | grep -Eq 'flags=SA|flags=.*SA'; then
         return 0
     fi
@@ -774,9 +779,6 @@ ${up_text}
 
 🌐 <b>本次解析：${#CHECK_ALL_IPS[@]} 个</b>
 ${all_text}
-
-<code>━━━━━━━━━━━━━━━━━━━━</code>
-💡 <i>域名每次巡检都会使用最新解析结果。</i>
 EOF
 }
 
@@ -804,7 +806,7 @@ build_recovery_message() {
 <b>✅【恢复通知】$(html_escape "${name}")</b>
 <code>━━━━━━━━━━━━━━━━━━━━</code>
 
-🟢 <b>状态</b>：<b>已恢复到不触发告警状态</b>
+🟢 <b>状态</b>：<b>已恢复</b>
 🎯 <b>目标</b>：<code>$(html_escape "${target}")</code>（${target_type}）
 🔎 <b>检测</b>：<code>$(html_escape "${method_text}")</code>
 📌 <b>策略</b>：<code>$(html_escape "$(mode_label "${mode}")")</code>
@@ -819,9 +821,6 @@ ${up_text}
 
 🌐 <b>本次解析：${#CHECK_ALL_IPS[@]} 个</b>
 ${all_text}
-
-<code>━━━━━━━━━━━━━━━━━━━━</code>
-💡 <i>同一告警未变化时不会重复通知。</i>
 EOF
 }
 
@@ -1623,10 +1622,91 @@ stop_loop() {
         elif [[ "${mode}" != "quiet" ]]; then
             warn "秒级后台巡检没有运行。"
         fi
-        rm -f "${LOOP_PID_FILE}"
+        rm -f "${LOOP_PID_FILE}" "${LOOP_INTERVAL_FILE}"
     elif [[ "${mode}" != "quiet" ]]; then
         warn "秒级后台巡检没有运行。"
     fi
+}
+
+get_running_loop_interval() {
+    local pid interval cmdline
+
+    [[ -f "${LOOP_PID_FILE}" ]] || return 1
+    pid="$(cat "${LOOP_PID_FILE}" 2>/dev/null || true)"
+    [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "${pid}" 2>/dev/null || return 1
+
+    if [[ -s "${LOOP_INTERVAL_FILE}" ]]; then
+        interval="$(cat "${LOOP_INTERVAL_FILE}" 2>/dev/null || true)"
+        if [[ "${interval}" =~ ^[0-9]+$ && "${interval}" -ge 1 ]]; then
+            printf '%s\n' "${interval}"
+            return 0
+        fi
+    fi
+
+    if [[ -r "/proc/${pid}/cmdline" ]]; then
+        cmdline="$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)"
+        if [[ "${cmdline}" =~ --loop[[:space:]]+([0-9]+) ]]; then
+            printf '%s\n' "${BASH_REMATCH[1]}"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+start_loop_schedule() {
+    local script_path="$1"
+    local interval="$2"
+    local pid
+
+    [[ "${interval}" =~ ^[0-9]+$ && "${interval}" -ge 1 ]] || {
+        err "秒级巡检间隔必须是大于等于 1 的数字。"
+        return 1
+    }
+
+    nohup bash "${script_path}" --loop "${interval}" >/dev/null 2>&1 &
+    pid="$!"
+    printf '%s\n' "${pid}" > "${LOOP_PID_FILE}"
+    printf '%s\n' "${interval}" > "${LOOP_INTERVAL_FILE}"
+    ok "秒级后台巡检已启动：每 ${interval} 秒执行一次，PID ${pid}。"
+}
+
+get_minute_cron_interval() {
+    local line first_field
+
+    have_crontab || return 1
+    line="$(crontab -l 2>/dev/null | grep -F "${CRON_MARK}" | tail -n 1 || true)"
+    [[ -n "${line}" ]] || return 1
+    first_field="${line%% *}"
+    if [[ "${first_field}" =~ ^\*/([0-9]+)$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+
+write_minute_cron() {
+    local script_path="$1"
+    local interval="$2"
+    local current quoted_path cron_cmd
+
+    have_crontab || {
+        err "当前系统没有 crontab，无法设置分钟级定时巡检。"
+        return 1
+    }
+    [[ "${interval}" =~ ^[0-9]+$ && "${interval}" -ge 1 && "${interval}" -le 59 ]] || {
+        err "分钟级巡检间隔必须是 1-59 之间的数字。"
+        return 1
+    }
+
+    current="$(cron_without_mark)"
+    quoted_path="$(shell_quote "${script_path}")"
+    cron_cmd="*/${interval} * * * * bash ${quoted_path} --cron >/dev/null 2>&1 ${CRON_MARK}"
+    {
+        printf '%s\n' "${current}"
+        printf '%s\n' "${cron_cmd}"
+    } | crontab -
 }
 
 run_loop() {
@@ -1639,7 +1719,8 @@ run_loop() {
     fi
 
     printf '%s\n' "$$" > "${LOOP_PID_FILE}"
-    trap 'rm -f "${LOOP_PID_FILE}"; exit 0' INT TERM EXIT
+    printf '%s\n' "${interval}" > "${LOOP_INTERVAL_FILE}"
+    trap 'rm -f "${LOOP_PID_FILE}" "${LOOP_INTERVAL_FILE}"; exit 0' INT TERM EXIT
 
     while true; do
         run_checks "loop"
@@ -1649,7 +1730,7 @@ run_loop() {
 
 setup_cron() {
     ensure_data
-    local schedule_type interval script_path quoted_path cron_cmd current pid
+    local schedule_type interval script_path current
 
     if [[ ! -s "${TARGETS_DB}" ]]; then
         warn "请先添加监控目标。"
@@ -1696,12 +1777,7 @@ setup_cron() {
     script_path="${SCRIPT_RUN_PATH}"
 
     if [[ "${schedule_type}" == "minute" ]]; then
-        quoted_path="$(shell_quote "${script_path}")"
-        cron_cmd="*/${interval} * * * * bash ${quoted_path} --cron >/dev/null 2>&1 ${CRON_MARK}"
-        {
-            printf '%s\n' "${current}"
-            printf '%s\n' "${cron_cmd}"
-        } | crontab -
+        write_minute_cron "${script_path}" "${interval}" || return 1
         ok "分钟级定时巡检已设置：每 ${interval} 分钟执行一次。"
         return 0
     fi
@@ -1709,10 +1785,7 @@ setup_cron() {
     if have_crontab; then
         printf '%s\n' "${current}" | crontab -
     fi
-    nohup bash "${script_path}" --loop "${interval}" >/dev/null 2>&1 &
-    pid="$!"
-    printf '%s\n' "${pid}" > "${LOOP_PID_FILE}"
-    ok "秒级后台巡检已启动：每 ${interval} 秒执行一次，PID ${pid}。"
+    start_loop_schedule "${script_path}" "${interval}" || return 1
 }
 
 remove_cron() {
@@ -1726,9 +1799,11 @@ remove_cron() {
 }
 
 update_self() {
-    local script_path target_path
+    local script_path target_path loop_interval minute_interval
 
     script_path="$(get_script_path)"
+    loop_interval="$(get_running_loop_interval 2>/dev/null || true)"
+    minute_interval="$(get_minute_cron_interval 2>/dev/null || true)"
 
     if is_temporary_script_path "${script_path}" || [[ ! -f "${script_path}" ]]; then
         target_path="${INSTALL_PATH}"
@@ -1743,7 +1818,15 @@ update_self() {
     if [[ "${target_path}" == "${INSTALL_PATH}" ]]; then
         ok "以后可以直接运行：bash ${INSTALL_PATH}"
     fi
-    warn "如果你之前启动了秒级后台巡检，请到“定时巡检设置”里重新设置一次，让后台进程使用新版脚本。"
+
+    if [[ -n "${minute_interval}" ]] && have_crontab; then
+        write_minute_cron "${target_path}" "${minute_interval}" && ok "分钟级定时巡检已自动更新：每 ${minute_interval} 分钟执行一次。"
+    fi
+
+    if [[ -n "${loop_interval}" ]]; then
+        stop_loop "quiet"
+        start_loop_schedule "${target_path}" "${loop_interval}" && ok "秒级后台巡检已自动重启并使用新版脚本。"
+    fi
 }
 
 safe_remove_dir() {
