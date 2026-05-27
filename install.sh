@@ -42,6 +42,12 @@ now_ts() {
     date '+%Y-%m-%d %H:%M:%S'
 }
 
+short_date() {
+    local value="$1"
+    [[ -n "${value}" ]] || { printf '-'; return 0; }
+    printf '%s' "${value%% *}"
+}
+
 get_script_path() {
     readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || printf '%s' "$0"
 }
@@ -712,13 +718,13 @@ list_targets() {
     fi
 
     local seq=1 id name target method port mode notifier_ids enabled created notify_text
-    printf '\n%-4s %-6s %-16s %-32s %-10s %-18s %-22s %s\n' "序号" "状态" "名称" "域名/IP" "检测" "告警策略" "通知位置" "创建时间"
+    printf '\n%-4s %-6s %-16s %-32s %-10s %-18s %-22s %s\n' "序号" "状态" "名称" "域名/IP" "检测" "告警策略" "通知位置" "创建日期"
     printf '%s\n' "------------------------------------------------------------------------------------------------------------------------"
     while IFS=$'\t' read -r id name target method port mode notifier_ids enabled created; do
         [[ -n "${id}" ]] || continue
         notify_text="$(describe_notifier_ids "${notifier_ids}")"
         printf '%-4s %-6s %-16s %-32s %-10s %-18s %-22s %s\n' \
-            "${seq}" "$(status_label "${enabled}")" "${name}" "${target}" "$(method_label "${method}" "${port}")" "$(mode_label "${mode}")" "${notify_text}" "${created}"
+            "${seq}" "$(status_label "${enabled}")" "${name}" "${target}" "$(method_label "${method}" "${port}")" "$(mode_label "${mode}")" "${notify_text}" "$(short_date "${created}")"
         seq=$((seq + 1))
     done < "${TARGETS_DB}"
 }
@@ -999,12 +1005,12 @@ list_bots() {
     fi
 
     local seq=1 id name token created hidden
-    printf '\n%-4s %-18s %-28s %s\n' "序号" "名称" "Token" "创建时间"
+    printf '\n%-4s %-18s %-28s %s\n' "序号" "名称" "Token" "创建日期"
     printf '%s\n' "----------------------------------------------------------------------------"
     while IFS=$'\t' read -r id name token created; do
         [[ -n "${id}" ]] || continue
         hidden="${token:0:8}********${token: -6}"
-        printf '%-4s %-18s %-28s %s\n' "${seq}" "${name}" "${hidden}" "${created}"
+        printf '%-4s %-18s %-28s %s\n' "${seq}" "${name}" "${hidden}" "$(short_date "${created}")"
         seq=$((seq + 1))
     done < "${BOTS_DB}"
 }
@@ -1101,12 +1107,12 @@ list_notifiers() {
     fi
 
     local seq=1 id name bot_id chat_id type enabled created bot_name
-    printf '\n%-4s %-6s %-18s %-16s %-24s %-12s %s\n' "序号" "状态" "名称" "机器人" "Chat ID / @频道" "类型" "创建时间"
+    printf '\n%-4s %-6s %-18s %-16s %-24s %-12s %s\n' "序号" "状态" "名称" "机器人" "Chat ID / @频道" "类型" "创建日期"
     printf '%s\n' "----------------------------------------------------------------------------------------------------"
     while IFS=$'\t' read -r id name bot_id chat_id type enabled created; do
         [[ -n "${id}" ]] || continue
         bot_name="$(get_bot_name_by_id "${bot_id}")"
-        printf '%-4s %-6s %-18s %-16s %-24s %-12s %s\n' "${seq}" "$(status_label "${enabled}")" "${name}" "${bot_name}" "${chat_id}" "${type}" "${created}"
+        printf '%-4s %-6s %-18s %-16s %-24s %-12s %s\n' "${seq}" "$(status_label "${enabled}")" "${name}" "${bot_name}" "${chat_id}" "${type}" "$(short_date "${created}")"
         seq=$((seq + 1))
     done < "${NOTIFIERS_DB}"
 }
