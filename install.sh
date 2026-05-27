@@ -15,6 +15,9 @@ LEGACY_CONFIG_FILE="$HOME/.tg_monitor.conf"
 CRON_MARK="# tg-monitor-auto"
 LOOP_PID_FILE="${CONFIG_DIR}/monitor-loop.pid"
 CHECK_TIMEOUT="${CHECK_TIMEOUT:-3}"
+ALERT_IP_LIST_LIMIT="${ALERT_IP_LIST_LIMIT:-30}"
+DEFAULT_UPDATE_BASE="https://raw.githubusercontent.com/inimemail/monitor/main"
+UPDATE_URL="${TG_MONITOR_UPDATE_URL:-}"
 
 red() { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -50,6 +53,21 @@ short_date() {
 
 get_script_path() {
     readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || printf '%s' "$0"
+}
+
+get_update_url() {
+    local script_path base
+    if [[ -n "${UPDATE_URL}" ]]; then
+        printf '%s\n' "${UPDATE_URL}"
+        return 0
+    fi
+
+    script_path="$(get_script_path)"
+    base="$(basename "${script_path}")"
+    case "${base}" in
+        install.sh) printf '%s/install.sh\n' "${DEFAULT_UPDATE_BASE}" ;;
+        *) printf '%s/auto.sh\n' "${DEFAULT_UPDATE_BASE}" ;;
+    esac
 }
 
 shell_quote() {
@@ -524,13 +542,24 @@ html_escape() {
 }
 
 join_ip_html() {
-    local value
+    local value index=1 limit total remain
     if [[ "$#" -eq 0 ]]; then
         printf '无'
         return 0
     fi
+
+    total="$#"
+    limit="${ALERT_IP_LIST_LIMIT:-30}"
+    [[ "${limit}" =~ ^[0-9]+$ && "${limit}" -gt 0 ]] || limit=30
+
     for value in "$@"; do
-        printf '• <code>%s</code>\n' "$(html_escape "${value}")"
+        if [[ "${index}" -gt "${limit}" ]]; then
+            remain=$((total - limit))
+            printf '... 还有 %s 个未展示\n' "${remain}"
+            break
+        fi
+        printf '<code>%02d</code>  <code>%s</code>\n' "${index}" "$(html_escape "${value}")"
+        index=$((index + 1))
     done
 }
 
@@ -540,7 +569,7 @@ build_alert_message() {
     local method="$3"
     local port="$4"
     local mode="$5"
-    local method_text status_text down_text up_text all_text target_type
+    local method_text status_text down_text up_text all_text target_type level_text title_icon title_text status_icon
 
     method_text="$(method_label "${method}" "${port}")"
     if [[ -n "${CHECK_ERROR}" ]]; then
@@ -550,6 +579,22 @@ build_alert_message() {
     else
         status_text="部分 IP 不通"
     fi
+    if [[ "${#CHECK_ALL_IPS[@]}" -eq 0 ]]; then
+        level_text="严重"
+        title_icon="🚨"
+        title_text="严重告警"
+        status_icon="❌"
+    elif [[ "${#CHECK_DOWN_IPS[@]}" -eq "${#CHECK_ALL_IPS[@]}" ]]; then
+        level_text="严重"
+        title_icon="🚨"
+        title_text="严重告警"
+        status_icon="❌"
+    else
+        level_text="注意"
+        title_icon="⚠️"
+        title_text="巡检告警"
+        status_icon="⚠️"
+    fi
 
     is_ip "${target}" && target_type="IP" || target_type="域名"
     down_text="$(join_ip_html "${CHECK_DOWN_IPS[@]}")"
@@ -557,22 +602,40 @@ build_alert_message() {
     all_text="$(join_ip_html "${CHECK_ALL_IPS[@]}")"
 
     cat <<EOF
-<b>[监控告警]</b> <code>$(html_escape "${name}")</code>
+<b>${title_icon}【${title_text}】$(html_escape "${name}")</b>
+<code>━━━━━━━━━━━━━━━━━━━━</code>
 
-<b>目标</b>：<code>$(html_escape "${target}")</code> (${target_type})
-<b>状态</b>：<b>$(html_escape "${status_text}")</b>
-<b>检测</b>：$(html_escape "${method_text}")
-<b>策略</b>：$(html_escape "$(mode_label "${mode}")")
-<b>时间</b>：$(html_escape "$(now_ts)")
+${status_icon} <b>状态</b>：<b>$(html_escape "${status_text}")</b>
+🔥 <b>级别</b>：$(html_escape "${level_text}")
+🎯 <b>目标</b>：<code>$(html_escape "${target}")</code>（${target_type}）
+🔎 <b>检测</b>：<code>$(html_escape "${method_text}")</code>
+📌 <b>策略</b>：<code>$(html_escape "$(mode_label "${mode}")")</code>
+🕒 <b>时间</b>：<code>$(html_escape "$(now_ts)")</code>
 
-<b>离线 IP (${#CHECK_DOWN_IPS[@]})</b>
+🔴 <b>故障 IP：${#CHECK_DOWN_IPS[@]}/${#CHECK_ALL_IPS[@]}</b>
 ${down_text}
 
-<b>在线 IP (${#CHECK_UP_IPS[@]})</b>
+🟢 <b>正常 IP：${#CHECK_UP_IPS[@]}/${#CHECK_ALL_IPS[@]}</b>
 ${up_text}
 
-<b>本次最新解析结果 (${#CHECK_ALL_IPS[@]})</b>
+🌐 <b>本次解析：${#CHECK_ALL_IPS[@]} 个</b>
 ${all_text}
+
+<code>━━━━━━━━━━━━━━━━━━━━</code>
+💡 <i>域名每次巡检都会使用最新解析结果。</i>
+EOF
+}
+
+build_test_message() {
+    cat <<EOF
+<b>✅【测试通知】$(html_escape "${APP_NAME}")</b>
+<code>━━━━━━━━━━━━━━━━━━━━</code>
+
+🟢 <b>状态</b>：通知位置可用
+🕒 <b>时间</b>：<code>$(html_escape "$(now_ts)")</code>
+
+📮 这是一条测试消息。收到这条消息，说明 Bot Token、Chat ID 和发送权限都正常。
+<code>━━━━━━━━━━━━━━━━━━━━</code>
 EOF
 }
 
@@ -1279,9 +1342,7 @@ test_notifier() {
     read_required "请输入要测试的通知位置序号" seq
     [[ "${seq}" =~ ^[0-9]+$ ]] || { warn "请输入数字序号。"; return 1; }
     wanted_id="$(get_id_by_seq "${NOTIFIERS_DB}" "${seq}")" || { warn "没有这个序号。"; return 1; }
-    msg="测试通知：${APP_NAME}
-时间：$(now_ts)
-结果：如果你看到这条消息，说明这个通知位置可用。"
+    msg="$(build_test_message)"
     if send_to_notifier_id "${wanted_id}" "${msg}"; then
         ok "测试通知已发送。"
     else
@@ -1405,6 +1466,137 @@ remove_cron() {
         printf '%s\n' "${current}" | crontab -
     fi
     ok "定时巡检任务已移除。"
+}
+
+update_self() {
+    local script_path update_url tmp mode
+
+    script_path="$(get_script_path)"
+    update_url="$(get_update_url)"
+
+    case "${script_path}" in
+        /dev/fd/*|/proc/self/fd/*|/tmp/*)
+            err "当前脚本是临时执行入口：${script_path}"
+            warn "请先把脚本安装到固定路径后再更新，例如：curl -fsSL ${update_url} -o /usr/local/bin/tg-monitor && chmod +x /usr/local/bin/tg-monitor"
+            return 1
+            ;;
+    esac
+
+    if [[ ! -f "${script_path}" ]]; then
+        err "找不到当前脚本文件：${script_path}"
+        return 1
+    fi
+
+    if [[ ! -w "${script_path}" ]]; then
+        err "当前用户没有写入权限：${script_path}"
+        warn "请用 root/sudo 运行更新，或手动下载覆盖这个文件。"
+        return 1
+    fi
+
+    tmp="$(mktemp)"
+    info "正在下载最新脚本：${update_url}"
+    if ! curl -fsSL "${update_url}" -o "${tmp}"; then
+        rm -f "${tmp}"
+        err "下载失败，请检查网络或更新地址。"
+        return 1
+    fi
+
+    if ! bash -n "${tmp}"; then
+        rm -f "${tmp}"
+        err "下载到的脚本语法检查未通过，已取消更新。"
+        return 1
+    fi
+
+    mode="$(stat -c '%a' "${script_path}" 2>/dev/null || true)"
+    cp "${tmp}" "${script_path}"
+    rm -f "${tmp}"
+    if [[ -n "${mode}" ]]; then
+        chmod "${mode}" "${script_path}" 2>/dev/null || true
+    else
+        chmod +x "${script_path}" 2>/dev/null || true
+    fi
+
+    ok "脚本已更新：${script_path}"
+    warn "如果你之前启动了秒级后台巡检，请到“定时巡检设置”里重新设置一次，让后台进程使用新版脚本。"
+}
+
+safe_remove_dir() {
+    local path="$1"
+    local resolved=""
+
+    [[ -n "${path}" ]] || { err "删除路径为空，已取消。"; return 1; }
+    resolved="$(readlink -f "${path}" 2>/dev/null || realpath "${path}" 2>/dev/null || printf '%s' "${path}")"
+
+    case "${resolved}" in
+        ""|"/"|"/root"|"/home"|"/etc"|"/usr"|"/usr/local"|"/opt"|"/var"|"/tmp"|"$HOME")
+            err "拒绝删除危险路径：${resolved}"
+            return 1
+            ;;
+    esac
+
+    rm -rf -- "${resolved}"
+}
+
+uninstall_all() {
+    local confirm_text script_path current
+
+    script_path="$(get_script_path)"
+
+    cat <<EOF
+
+即将彻底卸载：
+  1. 停止秒级后台巡检
+  2. 删除分钟级 cron 巡检任务
+  3. 删除配置目录：${CONFIG_DIR}
+  4. 删除旧配置文件：${LEGACY_CONFIG_FILE}
+  5. 可选删除当前脚本：${script_path}
+
+注意：删除后，监控目标、机器人、通知位置都会消失。
+EOF
+
+    confirm "确认继续彻底卸载" || { warn "已取消卸载。"; return 0; }
+    read_required "请输入 DELETE 继续" confirm_text
+    if [[ "${confirm_text}" != "DELETE" ]]; then
+        warn "确认文本不匹配，已取消卸载。"
+        return 0
+    fi
+
+    stop_loop "quiet"
+    if have_crontab; then
+        current="$(cron_without_mark)"
+        printf '%s\n' "${current}" | crontab -
+    fi
+
+    if [[ -d "${CONFIG_DIR}" ]]; then
+        safe_remove_dir "${CONFIG_DIR}" || return 1
+        ok "配置目录已删除：${CONFIG_DIR}"
+    else
+        warn "配置目录不存在：${CONFIG_DIR}"
+    fi
+
+    if [[ -f "${LEGACY_CONFIG_FILE}" ]]; then
+        rm -f -- "${LEGACY_CONFIG_FILE}"
+        ok "旧配置文件已删除：${LEGACY_CONFIG_FILE}"
+    fi
+
+    if confirm "是否同时删除当前脚本文件"; then
+        case "${script_path}" in
+            /dev/fd/*|/proc/self/fd/*)
+                warn "当前是临时执行入口，无法删除脚本文件：${script_path}"
+                ;;
+            *)
+                if [[ -f "${script_path}" && -w "${script_path}" ]]; then
+                    rm -f -- "${script_path}"
+                    ok "当前脚本已删除：${script_path}"
+                else
+                    warn "当前脚本不存在或没有写入权限：${script_path}"
+                fi
+                ;;
+        esac
+    fi
+
+    ok "彻底卸载完成。"
+    exit 0
 }
 
 show_summary() {
@@ -1561,11 +1753,13 @@ main_menu() {
 4. 立即巡检全部目标
 5. 定时巡检设置
 6. 查看配置概览
+7. 更新脚本
+8. 彻底卸载
 0. 退出
 ================================================
 EOF
         local choice
-        read -r -p "请选择 [0-6]: " choice
+        read -r -p "请选择 [0-8]: " choice
         case "${choice}" in
             1) target_menu ;;
             2) bot_menu ;;
@@ -1573,6 +1767,8 @@ EOF
             4) run_checks "manual"; pause_enter ;;
             5) cron_menu ;;
             6) show_summary; pause_enter ;;
+            7) update_self; pause_enter ;;
+            8) uninstall_all ;;
             0) echo "已退出。"; exit 0 ;;
             *) warn "无效选项，请重新输入。" ;;
         esac
@@ -1587,6 +1783,8 @@ usage() {
   bash auto.sh --loop 秒数  秒级后台循环巡检
   bash auto.sh run         手动执行一次巡检
   bash auto.sh list        查看配置概览
+  bash auto.sh update      更新当前脚本
+  bash auto.sh uninstall   彻底卸载并删除配置
 EOF
 }
 
@@ -1599,6 +1797,8 @@ main() {
         --loop|loop) run_loop "${2:-}" ;;
         run|test) run_checks "manual" ;;
         list|status) show_summary ;;
+        update|upgrade) update_self ;;
+        uninstall|remove|purge) uninstall_all ;;
         help|-h|--help) usage ;;
         "") main_menu ;;
         *) usage; exit 1 ;;
