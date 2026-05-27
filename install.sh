@@ -462,11 +462,13 @@ check_one_target() {
     fi
 
     CHECK_ALL_IPS=("${RESOLVED_IPS[@]}")
-    if [[ "${method}" != "ping" && ! command -v hping3 >/dev/null 2>&1 ]]; then
-        CHECK_ERROR="缺少 hping3，无法执行 TCP 检测"
-        CHECK_DOWN_IPS=("${CHECK_ALL_IPS[@]}")
-        CHECK_ALERT="yes"
-        return 0
+    if [[ "${method}" != "ping" ]]; then
+        if ! command -v hping3 >/dev/null 2>&1; then
+            CHECK_ERROR="缺少 hping3，无法执行 TCP 检测"
+            CHECK_DOWN_IPS=("${CHECK_ALL_IPS[@]}")
+            CHECK_ALERT="yes"
+            return 0
+        fi
     fi
 
     for ip in "${CHECK_ALL_IPS[@]}"; do
@@ -1598,4 +1600,3 @@ main() {
 }
 
 main "$@"
-
