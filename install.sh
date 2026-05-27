@@ -13,6 +13,7 @@ NOTIFIERS_DB="${CONFIG_DIR}/notifiers.tsv"
 SETTINGS_FILE="${CONFIG_DIR}/settings.conf"
 LEGACY_CONFIG_FILE="$HOME/.tg_monitor.conf"
 CRON_MARK="# tg-monitor-auto"
+LOOP_PID_FILE="${CONFIG_DIR}/monitor-loop.pid"
 CHECK_TIMEOUT="${CHECK_TIMEOUT:-3}"
 
 red() { printf '\033[31m%s\033[0m\n' "$*"; }
@@ -39,6 +40,24 @@ ensure_data() {
 
 now_ts() {
     date '+%Y-%m-%d %H:%M:%S'
+}
+
+get_script_path() {
+    readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || printf '%s' "$0"
+}
+
+shell_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+have_crontab() {
+    command -v crontab >/dev/null 2>&1
+}
+
+cron_without_mark() {
+    if have_crontab; then
+        crontab -l 2>/dev/null | grep -vF "${CRON_MARK}" || true
+    fi
 }
 
 clean_field() {
@@ -155,7 +174,7 @@ valid_port() {
 
 method_label() {
     case "$1" in
-        tcp|tcping) printf 'TCP %s' "$2" ;;
+        tcp|hping3) printf 'TCP %s' "$2" ;;
         *) printf 'Ping' ;;
     esac
 }
@@ -324,7 +343,7 @@ migrate_legacy_config() {
     target_id="$(next_id "${TARGETS_DB}")"
     created="$(now_ts)"
     method="${METHOD:-ping}"
-    [[ "${method}" == "tcping" ]] && method="tcp"
+    [[ "${method}" == "ping" ]] || method="tcp"
     port="${PORT:-0}"
     mode="${MODE:-ANY}"
 
@@ -336,12 +355,16 @@ migrate_legacy_config() {
 check_deps() {
     local missing=()
     local cmd
-    for cmd in curl dig ping timeout; do
+    for cmd in curl ping timeout; do
         command -v "${cmd}" >/dev/null 2>&1 || missing+=("${cmd}")
     done
 
-    if ! command -v tcping >/dev/null 2>&1 && ! command -v nc >/dev/null 2>&1; then
-        missing+=("tcping 或 nc")
+    if ! command -v dig >/dev/null 2>&1 && ! command -v getent >/dev/null 2>&1 && ! command -v nslookup >/dev/null 2>&1; then
+        missing+=("dig/getent/nslookup")
+    fi
+
+    if ! command -v hping3 >/dev/null 2>&1; then
+        missing+=("hping3")
     fi
 
     if [[ "${#missing[@]}" -eq 0 ]]; then
@@ -353,10 +376,11 @@ check_deps() {
     if [[ "${EUID:-$(id -u)}" -eq 0 && -x /usr/bin/apt-get ]]; then
         info "正在尝试通过 apt 安装依赖。"
         apt-get update -y >/dev/null 2>&1
-        apt-get install -y curl dnsutils iputils-ping coreutils tcping netcat-openbsd >/dev/null 2>&1 || true
+        apt-get install -y curl dnsutils iputils-ping coreutils hping3 >/dev/null 2>&1 || true
         ok "依赖安装流程已执行。"
     else
-        warn "如果要使用 TCP 检测，请安装 tcping 或 nc。Debian/Ubuntu 可执行：sudo apt-get install curl dnsutils iputils-ping tcping netcat-openbsd"
+        warn "TCP 检测使用 hping3。Debian/Ubuntu 可执行：sudo apt-get install curl dnsutils iputils-ping hping3"
+        warn "hping3 SYN 检测通常需要 root 权限运行脚本。"
     fi
 }
 
@@ -371,9 +395,24 @@ resolve_target_ips() {
 
     mapfile -t RESOLVED_IPS < <(
         {
-            dig +short "${target}" A 2>/dev/null
-            dig +short "${target}" AAAA 2>/dev/null
-        } | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:.]+$' | sort -u
+            if command -v dig >/dev/null 2>&1; then
+                dig +time=2 +tries=1 +short "${target}" A 2>/dev/null
+                dig +time=2 +tries=1 +short "${target}" AAAA 2>/dev/null
+            fi
+            if command -v getent >/dev/null 2>&1; then
+                getent ahosts "${target}" 2>/dev/null | awk '{print $1}'
+            fi
+            if command -v nslookup >/dev/null 2>&1; then
+                nslookup "${target}" 2>/dev/null | awk '
+                    /^Non-authoritative/ || /^Name:/ || /^名称:/ || /^非权威/ { answer=1 }
+                    answer && /^[[:space:]]*Address(es)?:[[:space:]]*/ {
+                        sub(/^[[:space:]]*Address(es)?:[[:space:]]*/, "")
+                        print
+                    }
+                    answer && /^[[:space:]]+[0-9A-Fa-f:.]+$/ { print $1 }
+                '
+            fi
+        } | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$|^[0-9A-Fa-f:.]+$' | awk '!seen[$0]++'
     )
 
     [[ "${#RESOLVED_IPS[@]}" -gt 0 ]]
@@ -382,15 +421,23 @@ resolve_target_ips() {
 tcp_check() {
     local host="$1"
     local port="$2"
-    if command -v tcping >/dev/null 2>&1; then
-        timeout "${CHECK_TIMEOUT}" tcping "${host}" "${port}" >/dev/null 2>&1
-        return $?
+    local output
+    TCP_CHECK_ERROR=""
+
+    if ! command -v hping3 >/dev/null 2>&1; then
+        TCP_CHECK_ERROR="缺少 hping3，无法执行 TCP 检测"
+        return 2
     fi
-    if command -v nc >/dev/null 2>&1; then
-        timeout "${CHECK_TIMEOUT}" nc -z -w "${CHECK_TIMEOUT}" "${host}" "${port}" >/dev/null 2>&1
-        return $?
+
+    output="$(timeout "${CHECK_TIMEOUT}" hping3 -S -p "${port}" -c 1 "${host}" 2>&1)"
+    if printf '%s\n' "${output}" | grep -Eq 'flags=SA|flags=.*SA'; then
+        return 0
     fi
-    return 2
+    if printf '%s\n' "${output}" | grep -Eqi 'operation not permitted|permission denied|not permitted|must be root|socket'; then
+        TCP_CHECK_ERROR="hping3 权限不足，通常需要 root 或 CAP_NET_RAW"
+        return 2
+    fi
+    return 1
 }
 
 check_one_target() {
@@ -406,6 +453,7 @@ check_one_target() {
     CHECK_UP_IPS=()
     CHECK_DOWN_IPS=()
     CHECK_ALL_IPS=()
+    TCP_CHECK_ERROR=""
 
     if ! resolve_target_ips "${target}"; then
         CHECK_ERROR="DNS 解析失败，未获取到可检测 IP"
@@ -414,6 +462,13 @@ check_one_target() {
     fi
 
     CHECK_ALL_IPS=("${RESOLVED_IPS[@]}")
+    if [[ "${method}" != "ping" && ! command -v hping3 >/dev/null 2>&1 ]]; then
+        CHECK_ERROR="缺少 hping3，无法执行 TCP 检测"
+        CHECK_DOWN_IPS=("${CHECK_ALL_IPS[@]}")
+        CHECK_ALERT="yes"
+        return 0
+    fi
+
     for ip in "${CHECK_ALL_IPS[@]}"; do
         if [[ "${method}" == "ping" ]]; then
             if ping -c 1 -W "${CHECK_TIMEOUT}" "${ip}" >/dev/null 2>&1; then
@@ -426,6 +481,9 @@ check_one_target() {
                 CHECK_UP_IPS+=("${ip}")
             else
                 CHECK_DOWN_IPS+=("${ip}")
+                if [[ -n "${TCP_CHECK_ERROR}" ]]; then
+                    CHECK_ERROR="${TCP_CHECK_ERROR}"
+                fi
             fi
         fi
     done
@@ -448,13 +506,33 @@ join_lines() {
     done
 }
 
+html_escape() {
+    local value="$1"
+    value="${value//&/&amp;}"
+    value="${value//</&lt;}"
+    value="${value//>/&gt;}"
+    value="${value//\"/&quot;}"
+    printf '%s' "${value}"
+}
+
+join_ip_html() {
+    local value
+    if [[ "$#" -eq 0 ]]; then
+        printf '无'
+        return 0
+    fi
+    for value in "$@"; do
+        printf '• <code>%s</code>\n' "$(html_escape "${value}")"
+    done
+}
+
 build_alert_message() {
     local name="$1"
     local target="$2"
     local method="$3"
     local port="$4"
     local mode="$5"
-    local method_text status_text down_text up_text all_text
+    local method_text status_text down_text up_text all_text target_type
 
     method_text="$(method_label "${method}" "${port}")"
     if [[ -n "${CHECK_ERROR}" ]]; then
@@ -465,25 +543,27 @@ build_alert_message() {
         status_text="部分 IP 不通"
     fi
 
-    down_text="$(join_lines "${CHECK_DOWN_IPS[@]}")"
-    up_text="$(join_lines "${CHECK_UP_IPS[@]}")"
-    all_text="$(join_lines "${CHECK_ALL_IPS[@]}")"
+    is_ip "${target}" && target_type="IP" || target_type="域名"
+    down_text="$(join_ip_html "${CHECK_DOWN_IPS[@]}")"
+    up_text="$(join_ip_html "${CHECK_UP_IPS[@]}")"
+    all_text="$(join_ip_html "${CHECK_ALL_IPS[@]}")"
 
     cat <<EOF
-监控告警：${name}
-目标：${target}
-检测方式：${method_text}
-告警策略：$(mode_label "${mode}")
-当前状态：${status_text}
-时间：$(now_ts)
+<b>[监控告警]</b> <code>$(html_escape "${name}")</code>
 
-离线 IP：
+<b>目标</b>：<code>$(html_escape "${target}")</code> (${target_type})
+<b>状态</b>：<b>$(html_escape "${status_text}")</b>
+<b>检测</b>：$(html_escape "${method_text}")
+<b>策略</b>：$(html_escape "$(mode_label "${mode}")")
+<b>时间</b>：$(html_escape "$(now_ts)")
+
+<b>离线 IP (${#CHECK_DOWN_IPS[@]})</b>
 ${down_text}
 
-在线 IP：
+<b>在线 IP (${#CHECK_UP_IPS[@]})</b>
 ${up_text}
 
-解析结果：
+<b>本次最新解析结果 (${#CHECK_ALL_IPS[@]})</b>
 ${all_text}
 EOF
 }
@@ -495,6 +575,7 @@ send_telegram() {
     curl -fsS -X POST "https://api.telegram.org/bot${token}/sendMessage" \
         --data-urlencode "chat_id=${chat_id}" \
         --data-urlencode "text=${text}" \
+        --data-urlencode "parse_mode=HTML" \
         --data-urlencode "disable_web_page_preview=true" >/dev/null 2>&1
 }
 
@@ -502,13 +583,25 @@ send_to_notifier_id() {
     local wanted_id="$1"
     local text="$2"
     local id name bot_id chat_id type enabled created token
+    SEND_LAST_STATUS="failed"
     while IFS=$'\t' read -r id name bot_id chat_id type enabled created; do
         [[ "${id}" == "${wanted_id}" ]] || continue
-        [[ "${enabled}" == "yes" ]] || return 0
-        token="$(get_bot_token_by_id "${bot_id}")" || return 1
-        send_telegram "${token}" "${chat_id}" "${text}"
-        return $?
+        if [[ "${enabled}" != "yes" ]]; then
+            SEND_LAST_STATUS="skipped"
+            return 0
+        fi
+        token="$(get_bot_token_by_id "${bot_id}")" || {
+            SEND_LAST_STATUS="failed"
+            return 1
+        }
+        if send_telegram "${token}" "${chat_id}" "${text}"; then
+            SEND_LAST_STATUS="sent"
+            return 0
+        fi
+        SEND_LAST_STATUS="failed"
+        return 1
     done < "${NOTIFIERS_DB}"
+    SEND_LAST_STATUS="failed"
     return 1
 }
 
@@ -516,41 +609,61 @@ send_to_target_notifiers() {
     local notifier_ids="$1"
     local text="$2"
     local id name bot_id chat_id type enabled created
-    local sent=0 failed=0
+    local sent=0 failed=0 skipped=0
 
+    SEND_SENT=0
+    SEND_FAILED=0
+    SEND_SKIPPED=0
     if [[ "${notifier_ids}" == "none" || -z "${notifier_ids}" ]]; then
+        SEND_SKIPPED=1
         return 0
     fi
 
     if [[ "${notifier_ids}" == "all" ]]; then
         while IFS=$'\t' read -r id name bot_id chat_id type enabled created; do
-            [[ -n "${id}" && "${enabled}" == "yes" ]] || continue
-            if send_to_notifier_id "${id}" "${text}"; then
-                sent=$((sent + 1))
-            else
-                failed=$((failed + 1))
-            fi
+            [[ -n "${id}" ]] || continue
+            send_to_notifier_id "${id}" "${text}" || true
+            case "${SEND_LAST_STATUS}" in
+                sent) sent=$((sent + 1)) ;;
+                skipped) skipped=$((skipped + 1)) ;;
+                *) failed=$((failed + 1)) ;;
+            esac
         done < "${NOTIFIERS_DB}"
     else
         IFS=',' read -r -a ids <<< "${notifier_ids}"
         for id in "${ids[@]}"; do
             id="$(clean_field "${id}")"
             [[ -n "${id}" ]] || continue
-            if send_to_notifier_id "${id}" "${text}"; then
-                sent=$((sent + 1))
-            else
-                failed=$((failed + 1))
-            fi
+            send_to_notifier_id "${id}" "${text}" || true
+            case "${SEND_LAST_STATUS}" in
+                sent) sent=$((sent + 1)) ;;
+                skipped) skipped=$((skipped + 1)) ;;
+                *) failed=$((failed + 1)) ;;
+            esac
         done
     fi
 
-    [[ "${failed}" -eq 0 || "${sent}" -gt 0 ]]
+    SEND_SENT="${sent}"
+    SEND_FAILED="${failed}"
+    SEND_SKIPPED="${skipped}"
+    [[ "${failed}" -eq 0 && "${sent}" -gt 0 ]]
+}
+
+print_send_result() {
+    local prefix="$1"
+    if [[ "${SEND_SENT:-0}" -gt 0 ]]; then
+        ok "${prefix}通知成功 ${SEND_SENT} 个，失败 ${SEND_FAILED:-0} 个，跳过 ${SEND_SKIPPED:-0} 个。"
+    elif [[ "${SEND_FAILED:-0}" -gt 0 ]]; then
+        err "${prefix}已触发告警，但通知发送失败 ${SEND_FAILED} 个。请检查 Bot Token、Chat ID、群/频道权限或服务器网络。"
+    else
+        warn "${prefix}已触发告警，但没有启用的通知位置。"
+    fi
 }
 
 run_checks() {
     local run_mode="${1:-manual}"
     local id name target method port mode notifier_ids enabled created msg method_text
-    local total=0 alerts=0
+    local total=0 alerts=0 sent_total=0 failed_total=0 skipped_total=0
 
     ensure_data
     migrate_legacy_config
@@ -572,8 +685,11 @@ run_checks() {
             alerts=$((alerts + 1))
             msg="$(build_alert_message "${name}" "${target}" "${method}" "${port}" "${mode}")"
             send_to_target_notifiers "${notifier_ids}" "${msg}" || true
+            sent_total=$((sent_total + ${SEND_SENT:-0}))
+            failed_total=$((failed_total + ${SEND_FAILED:-0}))
+            skipped_total=$((skipped_total + ${SEND_SKIPPED:-0}))
             if [[ "${run_mode}" == "manual" ]]; then
-                warn "[${name}] 触发告警，已按配置发送通知。"
+                print_send_result "[${name}] "
             fi
         elif [[ "${run_mode}" == "manual" ]]; then
             ok "[${name}] 正常：${#CHECK_UP_IPS[@]}/${#CHECK_ALL_IPS[@]} 可达。"
@@ -582,7 +698,7 @@ run_checks() {
 
     if [[ "${run_mode}" == "manual" ]]; then
         echo
-        ok "巡检完成：启用目标 ${total} 个，触发告警 ${alerts} 个。"
+        ok "巡检完成：启用目标 ${total} 个，触发告警 ${alerts} 个，通知成功 ${sent_total} 个，失败 ${failed_total} 个，跳过 ${skipped_total} 个。"
     fi
 }
 
@@ -755,7 +871,7 @@ run_one_target() {
         if [[ "${CHECK_ALERT}" == "yes" ]]; then
             msg="$(build_alert_message "${name}" "${target}" "${method}" "${port}" "${mode}")"
             send_to_target_notifiers "${notifier_ids}" "${msg}" || true
-            warn "[${name}] 触发告警，已按配置发送通知。"
+            print_send_result "[${name}] "
         else
             ok "[${name}] 正常：${#CHECK_UP_IPS[@]}/${#CHECK_ALL_IPS[@]} 可达。"
         fi
@@ -1165,9 +1281,49 @@ test_notifier() {
     fi
 }
 
+stop_loop() {
+    local mode="${1:-}"
+    local pid=""
+
+    if [[ -f "${LOOP_PID_FILE}" ]]; then
+        pid="$(cat "${LOOP_PID_FILE}" 2>/dev/null || true)"
+        if [[ "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
+            kill "${pid}" 2>/dev/null || true
+            sleep 1
+            if kill -0 "${pid}" 2>/dev/null; then
+                kill -9 "${pid}" 2>/dev/null || true
+            fi
+            [[ "${mode}" == "quiet" ]] || ok "秒级后台巡检已停止，PID ${pid}。"
+        elif [[ "${mode}" != "quiet" ]]; then
+            warn "秒级后台巡检没有运行。"
+        fi
+        rm -f "${LOOP_PID_FILE}"
+    elif [[ "${mode}" != "quiet" ]]; then
+        warn "秒级后台巡检没有运行。"
+    fi
+}
+
+run_loop() {
+    local interval="${1:-}"
+    ensure_data
+
+    if [[ ! "${interval}" =~ ^[0-9]+$ || "${interval}" -lt 1 ]]; then
+        err "秒级巡检间隔必须是大于等于 1 的数字。"
+        exit 1
+    fi
+
+    printf '%s\n' "$$" > "${LOOP_PID_FILE}"
+    trap 'rm -f "${LOOP_PID_FILE}"; exit 0' INT TERM EXIT
+
+    while true; do
+        run_checks "loop"
+        sleep "${interval}"
+    done
+}
+
 setup_cron() {
     ensure_data
-    local cron_min script_path quoted_path cron_cmd current
+    local schedule_type interval script_path quoted_path cron_cmd current pid
 
     if [[ ! -s "${TARGETS_DB}" ]]; then
         warn "请先添加监控目标。"
@@ -1178,37 +1334,91 @@ setup_cron() {
     fi
 
     while true; do
-        read_default "几分钟巡检一次" "3" cron_min
-        [[ "${cron_min}" =~ ^[0-9]+$ && "${cron_min}" -ge 1 && "${cron_min}" -le 59 ]] && break
-        warn "请输入 1-59 之间的数字。"
+        echo "巡检间隔单位："
+        echo "  1. 秒"
+        echo "  2. 分钟"
+        read_default "请选择" "2" schedule_type
+        case "${schedule_type}" in
+            1|秒|s|S) schedule_type="second"; break ;;
+            2|分钟|m|M) schedule_type="minute"; break ;;
+            *) warn "请输入 1 或 2。" ;;
+        esac
     done
 
-    script_path="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || printf '%s' "$0")"
-    quoted_path="'$(printf '%s' "${script_path}" | sed "s/'/'\\\\''/g")'"
-    cron_cmd="*/${cron_min} * * * * bash ${quoted_path} --cron >/dev/null 2>&1 ${CRON_MARK}"
-    current="$(crontab -l 2>/dev/null | grep -vF "${CRON_MARK}" || true)"
-    {
-        printf '%s\n' "${current}"
-        printf '%s\n' "${cron_cmd}"
-    } | crontab -
+    if [[ "${schedule_type}" == "second" ]]; then
+        while true; do
+            read_default "几秒巡检一次" "30" interval
+            [[ "${interval}" =~ ^[0-9]+$ && "${interval}" -ge 1 ]] && break
+            warn "请输入大于等于 1 的数字。"
+        done
+    else
+        while true; do
+            read_default "几分钟巡检一次" "3" interval
+            [[ "${interval}" =~ ^[0-9]+$ && "${interval}" -ge 1 && "${interval}" -le 59 ]] && break
+            warn "请输入 1-59 之间的数字。"
+        done
+    fi
 
-    ok "定时巡检已设置：每 ${cron_min} 分钟执行一次。"
+    if [[ "${schedule_type}" == "minute" ]] && ! have_crontab; then
+        err "当前系统没有 crontab，无法设置分钟级定时巡检。请选择秒级巡检，或先安装 cron。"
+        return 1
+    fi
+
+    stop_loop "quiet"
+    current="$(cron_without_mark)"
+
+    if [[ "${schedule_type}" == "minute" ]]; then
+        script_path="$(get_script_path)"
+        quoted_path="$(shell_quote "${script_path}")"
+        cron_cmd="*/${interval} * * * * bash ${quoted_path} --cron >/dev/null 2>&1 ${CRON_MARK}"
+        {
+            printf '%s\n' "${current}"
+            printf '%s\n' "${cron_cmd}"
+        } | crontab -
+        ok "分钟级定时巡检已设置：每 ${interval} 分钟执行一次。"
+        return 0
+    fi
+
+    if have_crontab; then
+        printf '%s\n' "${current}" | crontab -
+    fi
+    script_path="$(get_script_path)"
+    nohup bash "${script_path}" --loop "${interval}" >/dev/null 2>&1 &
+    pid="$!"
+    printf '%s\n' "${pid}" > "${LOOP_PID_FILE}"
+    ok "秒级后台巡检已启动：每 ${interval} 秒执行一次，PID ${pid}。"
 }
 
 remove_cron() {
     local current
-    current="$(crontab -l 2>/dev/null | grep -vF "${CRON_MARK}" || true)"
-    printf '%s\n' "${current}" | crontab -
+    stop_loop "quiet"
+    if have_crontab; then
+        current="$(cron_without_mark)"
+        printf '%s\n' "${current}" | crontab -
+    fi
     ok "定时巡检任务已移除。"
 }
 
 show_summary() {
     ensure_data
-    local targets bots notifiers cron_lines
+    local targets bots notifiers cron_lines loop_status pid
     targets="$(row_count "${TARGETS_DB}")"
     bots="$(row_count "${BOTS_DB}")"
     notifiers="$(row_count "${NOTIFIERS_DB}")"
-    cron_lines="$(crontab -l 2>/dev/null | grep -F "${CRON_MARK}" || true)"
+    if have_crontab; then
+        cron_lines="$(crontab -l 2>/dev/null | grep -F "${CRON_MARK}" || true)"
+    else
+        cron_lines="当前系统没有 crontab"
+    fi
+    loop_status="未运行"
+    if [[ -f "${LOOP_PID_FILE}" ]]; then
+        pid="$(cat "${LOOP_PID_FILE}" 2>/dev/null || true)"
+        if [[ "${pid}" =~ ^[0-9]+$ ]] && kill -0 "${pid}" 2>/dev/null; then
+            loop_status="运行中，PID ${pid}"
+        else
+            loop_status="PID 文件存在但进程不在：${pid:-unknown}"
+        fi
+    fi
 
     cat <<EOF
 
@@ -1216,8 +1426,10 @@ show_summary() {
 监控目标：${targets} 个
 Telegram 机器人：${bots} 个
 通知位置：${notifiers} 个
-定时任务：
+分钟级 cron：
 ${cron_lines:-未设置}
+秒级后台巡检：
+${loop_status}
 EOF
 }
 
@@ -1311,8 +1523,8 @@ cron_menu() {
         cat <<EOF
 
 =========== 定时巡检 ===========
-1. 设置/更新定时任务
-2. 移除定时任务
+1. 设置/更新巡检间隔
+2. 停止定时巡检
 3. 查看配置概览
 0. 返回主菜单
 ================================
@@ -1364,6 +1576,7 @@ usage() {
 用法：
   bash auto.sh             打开交互菜单
   bash auto.sh --cron      执行一次巡检，供 cron 调用
+  bash auto.sh --loop 秒数  秒级后台循环巡检
   bash auto.sh run         手动执行一次巡检
   bash auto.sh list        查看配置概览
 EOF
@@ -1375,6 +1588,7 @@ main() {
 
     case "${1:-}" in
         --cron|cron) run_checks "cron" ;;
+        --loop|loop) run_loop "${2:-}" ;;
         run|test) run_checks "manual" ;;
         list|status) show_summary ;;
         help|-h|--help) usage ;;
