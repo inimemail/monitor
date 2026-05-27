@@ -10,12 +10,14 @@ CONFIG_DIR="${TG_MONITOR_HOME:-$HOME/.tg-monitor}"
 TARGETS_DB="${CONFIG_DIR}/targets.tsv"
 BOTS_DB="${CONFIG_DIR}/bots.tsv"
 NOTIFIERS_DB="${CONFIG_DIR}/notifiers.tsv"
+STATES_DB="${CONFIG_DIR}/states.tsv"
 SETTINGS_FILE="${CONFIG_DIR}/settings.conf"
 LEGACY_CONFIG_FILE="$HOME/.tg_monitor.conf"
 CRON_MARK="# tg-monitor-auto"
 LOOP_PID_FILE="${CONFIG_DIR}/monitor-loop.pid"
 CHECK_TIMEOUT="${CHECK_TIMEOUT:-3}"
 ALERT_IP_LIST_LIMIT="${ALERT_IP_LIST_LIMIT:-30}"
+DOMAIN_ALERT_SIGNATURE_MODE="${DOMAIN_ALERT_SIGNATURE_MODE:-summary}"
 DEFAULT_UPDATE_BASE="https://raw.githubusercontent.com/inimemail/monitor/main"
 DEFAULT_UPDATE_URL="${DEFAULT_UPDATE_BASE}/install.sh"
 UPDATE_URL="${TG_MONITOR_UPDATE_URL:-}"
@@ -38,9 +40,9 @@ pause_enter() {
 
 ensure_data() {
     mkdir -p "${CONFIG_DIR}"
-    touch "${TARGETS_DB}" "${BOTS_DB}" "${NOTIFIERS_DB}" "${SETTINGS_FILE}"
+    touch "${TARGETS_DB}" "${BOTS_DB}" "${NOTIFIERS_DB}" "${STATES_DB}" "${SETTINGS_FILE}"
     chmod 700 "${CONFIG_DIR}" 2>/dev/null || true
-    chmod 600 "${TARGETS_DB}" "${BOTS_DB}" "${NOTIFIERS_DB}" "${SETTINGS_FILE}" 2>/dev/null || true
+    chmod 600 "${TARGETS_DB}" "${BOTS_DB}" "${NOTIFIERS_DB}" "${STATES_DB}" "${SETTINGS_FILE}" 2>/dev/null || true
 }
 
 now_ts() {
@@ -634,6 +636,87 @@ join_ip_html() {
     done
 }
 
+sorted_csv() {
+    if [[ "$#" -eq 0 ]]; then
+        printf '-'
+        return 0
+    fi
+    printf '%s\n' "$@" | sort -u | awk 'BEGIN { first=1 } { if (!first) printf ","; printf "%s", $0; first=0 }'
+}
+
+build_alert_signature() {
+    local target="$1"
+    local method="$2"
+    local port="$3"
+    local mode="$4"
+    local error status_key down_ips all_ips
+
+    error="${CHECK_ERROR:-}"
+    if [[ -n "${error}" ]]; then
+        status_key="error:${error}"
+    elif [[ "${#CHECK_ALL_IPS[@]}" -eq 0 ]]; then
+        status_key="no-ip"
+    elif [[ "${#CHECK_DOWN_IPS[@]}" -eq "${#CHECK_ALL_IPS[@]}" ]]; then
+        status_key="all-down"
+    else
+        status_key="partial-down"
+    fi
+
+    if is_domain "${target}" && [[ "${DOMAIN_ALERT_SIGNATURE_MODE}" != "strict" ]]; then
+        down_ips="$(sorted_csv "${CHECK_DOWN_IPS[@]}")"
+        printf 'target=domain|method=%s|port=%s|mode=%s|status=%s|down=%s' "${method}" "${port}" "${mode}" "${status_key}" "${down_ips}"
+        return 0
+    fi
+
+    down_ips="$(sorted_csv "${CHECK_DOWN_IPS[@]}")"
+    all_ips="$(sorted_csv "${CHECK_ALL_IPS[@]}")"
+    printf 'target=ip|method=%s|port=%s|mode=%s|status=%s|down=%s|all=%s' "${method}" "${port}" "${mode}" "${status_key}" "${down_ips}" "${all_ips}"
+}
+
+get_target_state() {
+    local wanted_id="$1"
+    local id state signature updated
+
+    STATE_STATUS=""
+    STATE_SIGNATURE=""
+    STATE_UPDATED=""
+    while IFS=$'\t' read -r id state signature updated; do
+        [[ "${id}" == "${wanted_id}" ]] || continue
+        STATE_STATUS="${state}"
+        STATE_SIGNATURE="${signature}"
+        STATE_UPDATED="${updated}"
+        return 0
+    done < "${STATES_DB}"
+    return 1
+}
+
+set_target_state() {
+    local target_id="$1"
+    local state="$2"
+    local signature="$3"
+    local tmp id old_state old_signature updated
+
+    tmp="$(mktemp)"
+    while IFS=$'\t' read -r id old_state old_signature updated; do
+        [[ -n "${id}" && "${id}" != "${target_id}" ]] || continue
+        printf '%s\t%s\t%s\t%s\n' "${id}" "${old_state}" "${old_signature}" "${updated}" >> "${tmp}"
+    done < "${STATES_DB}"
+    printf '%s\t%s\t%s\t%s\n' "${target_id}" "${state}" "${signature}" "$(now_ts)" >> "${tmp}"
+    mv "${tmp}" "${STATES_DB}"
+}
+
+clear_target_state() {
+    local target_id="$1"
+    local tmp id state signature updated
+
+    tmp="$(mktemp)"
+    while IFS=$'\t' read -r id state signature updated; do
+        [[ -n "${id}" && "${id}" != "${target_id}" ]] || continue
+        printf '%s\t%s\t%s\t%s\n' "${id}" "${state}" "${signature}" "${updated}" >> "${tmp}"
+    done < "${STATES_DB}"
+    mv "${tmp}" "${STATES_DB}"
+}
+
 build_alert_message() {
     local name="$1"
     local target="$2"
@@ -694,6 +777,51 @@ ${all_text}
 
 <code>━━━━━━━━━━━━━━━━━━━━</code>
 💡 <i>域名每次巡检都会使用最新解析结果。</i>
+EOF
+}
+
+build_recovery_message() {
+    local name="$1"
+    local target="$2"
+    local method="$3"
+    local port="$4"
+    local mode="$5"
+    local recovered_from="${6:-}"
+    local method_text down_text up_text all_text target_type recovered_from_text
+
+    method_text="$(method_label "${method}" "${port}")"
+    is_ip "${target}" && target_type="IP" || target_type="域名"
+    down_text="$(join_ip_html "${CHECK_DOWN_IPS[@]}")"
+    up_text="$(join_ip_html "${CHECK_UP_IPS[@]}")"
+    all_text="$(join_ip_html "${CHECK_ALL_IPS[@]}")"
+    if [[ -n "${recovered_from}" ]]; then
+        recovered_from_text="🧾 <b>上次告警时间</b>：<code>$(html_escape "${recovered_from}")</code>"
+    else
+        recovered_from_text="🧾 <b>上次告警时间</b>：<code>未知</code>"
+    fi
+
+    cat <<EOF
+<b>✅【恢复通知】$(html_escape "${name}")</b>
+<code>━━━━━━━━━━━━━━━━━━━━</code>
+
+🟢 <b>状态</b>：<b>已恢复到不触发告警状态</b>
+🎯 <b>目标</b>：<code>$(html_escape "${target}")</code>（${target_type}）
+🔎 <b>检测</b>：<code>$(html_escape "${method_text}")</code>
+📌 <b>策略</b>：<code>$(html_escape "$(mode_label "${mode}")")</code>
+🕒 <b>恢复时间</b>：<code>$(html_escape "$(now_ts)")</code>
+${recovered_from_text}
+
+🔴 <b>故障 IP：${#CHECK_DOWN_IPS[@]}/${#CHECK_ALL_IPS[@]}</b>
+${down_text}
+
+🟢 <b>正常 IP：${#CHECK_UP_IPS[@]}/${#CHECK_ALL_IPS[@]}</b>
+${up_text}
+
+🌐 <b>本次解析：${#CHECK_ALL_IPS[@]} 个</b>
+${all_text}
+
+<code>━━━━━━━━━━━━━━━━━━━━</code>
+💡 <i>同一告警未变化时不会重复通知。</i>
 EOF
 }
 
@@ -802,10 +930,65 @@ print_send_result() {
     fi
 }
 
+handle_check_notification() {
+    local target_id="$1"
+    local name="$2"
+    local target="$3"
+    local method="$4"
+    local port="$5"
+    local mode="$6"
+    local notifier_ids="$7"
+    local run_mode="${8:-manual}"
+    local signature msg old_updated
+
+    NOTIFY_EVENT="none"
+    NOTIFY_SENT=0
+    NOTIFY_FAILED=0
+    NOTIFY_SKIPPED=0
+
+    get_target_state "${target_id}" || true
+
+    if [[ "${CHECK_ALERT}" == "yes" ]]; then
+        signature="$(build_alert_signature "${target}" "${method}" "${port}" "${mode}")"
+        if [[ "${STATE_STATUS}" == "alert" && "${STATE_SIGNATURE}" == "${signature}" ]]; then
+            NOTIFY_EVENT="duplicate"
+            [[ "${run_mode}" == "manual" ]] && warn "[${name}] 告警未变化，已跳过重复通知。"
+            return 0
+        fi
+
+        msg="$(build_alert_message "${name}" "${target}" "${method}" "${port}" "${mode}")"
+        send_to_target_notifiers "${notifier_ids}" "${msg}" || true
+        set_target_state "${target_id}" "alert" "${signature}"
+
+        NOTIFY_EVENT="alert"
+        NOTIFY_SENT="${SEND_SENT:-0}"
+        NOTIFY_FAILED="${SEND_FAILED:-0}"
+        NOTIFY_SKIPPED="${SEND_SKIPPED:-0}"
+        [[ "${run_mode}" == "manual" ]] && print_send_result "[${name}] "
+        return 0
+    fi
+
+    if [[ "${STATE_STATUS}" == "alert" ]]; then
+        old_updated="${STATE_UPDATED:-}"
+        msg="$(build_recovery_message "${name}" "${target}" "${method}" "${port}" "${mode}" "${old_updated}")"
+        send_to_target_notifiers "${notifier_ids}" "${msg}" || true
+        clear_target_state "${target_id}"
+
+        NOTIFY_EVENT="recovery"
+        NOTIFY_SENT="${SEND_SENT:-0}"
+        NOTIFY_FAILED="${SEND_FAILED:-0}"
+        NOTIFY_SKIPPED="${SEND_SKIPPED:-0}"
+        [[ "${run_mode}" == "manual" ]] && print_send_result "[${name}] 恢复"
+        return 0
+    fi
+
+    [[ "${run_mode}" == "manual" ]] && ok "[${name}] 正常：${#CHECK_UP_IPS[@]}/${#CHECK_ALL_IPS[@]} 可达。"
+}
+
 run_checks() {
     local run_mode="${1:-manual}"
-    local id name target method port mode notifier_ids enabled created msg method_text
-    local total=0 alerts=0 sent_total=0 failed_total=0 skipped_total=0
+    local id name target method port mode notifier_ids enabled created method_text
+    local total=0 alerts=0 recoveries=0 duplicates=0 sent_total=0 failed_total=0 skipped_total=0
 
     ensure_data
     migrate_legacy_config
@@ -823,24 +1006,30 @@ run_checks() {
 
         check_one_target "${name}" "${target}" "${method}" "${port}" "${mode}"
 
-        if [[ "${CHECK_ALERT}" == "yes" ]]; then
-            alerts=$((alerts + 1))
-            msg="$(build_alert_message "${name}" "${target}" "${method}" "${port}" "${mode}")"
-            send_to_target_notifiers "${notifier_ids}" "${msg}" || true
-            sent_total=$((sent_total + ${SEND_SENT:-0}))
-            failed_total=$((failed_total + ${SEND_FAILED:-0}))
-            skipped_total=$((skipped_total + ${SEND_SKIPPED:-0}))
-            if [[ "${run_mode}" == "manual" ]]; then
-                print_send_result "[${name}] "
-            fi
-        elif [[ "${run_mode}" == "manual" ]]; then
-            ok "[${name}] 正常：${#CHECK_UP_IPS[@]}/${#CHECK_ALL_IPS[@]} 可达。"
-        fi
+        handle_check_notification "${id}" "${name}" "${target}" "${method}" "${port}" "${mode}" "${notifier_ids}" "${run_mode}"
+        case "${NOTIFY_EVENT}" in
+            alert)
+                alerts=$((alerts + 1))
+                sent_total=$((sent_total + ${NOTIFY_SENT:-0}))
+                failed_total=$((failed_total + ${NOTIFY_FAILED:-0}))
+                skipped_total=$((skipped_total + ${NOTIFY_SKIPPED:-0}))
+                ;;
+            recovery)
+                recoveries=$((recoveries + 1))
+                sent_total=$((sent_total + ${NOTIFY_SENT:-0}))
+                failed_total=$((failed_total + ${NOTIFY_FAILED:-0}))
+                skipped_total=$((skipped_total + ${NOTIFY_SKIPPED:-0}))
+                ;;
+            duplicate)
+                alerts=$((alerts + 1))
+                duplicates=$((duplicates + 1))
+                ;;
+        esac
     done < "${TARGETS_DB}"
 
     if [[ "${run_mode}" == "manual" ]]; then
         echo
-        ok "巡检完成：启用目标 ${total} 个，触发告警 ${alerts} 个，通知成功 ${sent_total} 个，失败 ${failed_total} 个，跳过 ${skipped_total} 个。"
+        ok "巡检完成：启用目标 ${total} 个，触发告警 ${alerts} 个，恢复 ${recoveries} 个，重复跳过 ${duplicates} 个，通知成功 ${sent_total} 个，失败 ${failed_total} 个，跳过 ${skipped_total} 个。"
     fi
 }
 
@@ -1004,19 +1193,13 @@ run_one_target() {
     [[ "${seq}" =~ ^[0-9]+$ ]] || { warn "请输入数字序号。"; return 1; }
     wanted_id="$(get_id_by_seq "${TARGETS_DB}" "${seq}")" || { warn "没有这个序号。"; return 1; }
 
-    local id name target method port mode notifier_ids enabled created msg
+    local id name target method port mode notifier_ids enabled created
     while IFS=$'\t' read -r id name target method port mode notifier_ids enabled created; do
         [[ "${id}" == "${wanted_id}" ]] || continue
         [[ "${enabled}" == "yes" ]] || warn "该目标当前是停用状态，本次仍会手动检测一次。"
         info "正在检测 [${name}] ${target} ($(method_label "${method}" "${port}"))"
         check_one_target "${name}" "${target}" "${method}" "${port}" "${mode}"
-        if [[ "${CHECK_ALERT}" == "yes" ]]; then
-            msg="$(build_alert_message "${name}" "${target}" "${method}" "${port}" "${mode}")"
-            send_to_target_notifiers "${notifier_ids}" "${msg}" || true
-            print_send_result "[${name}] "
-        else
-            ok "[${name}] 正常：${#CHECK_UP_IPS[@]}/${#CHECK_ALL_IPS[@]} 可达。"
-        fi
+        handle_check_notification "${id}" "${name}" "${target}" "${method}" "${port}" "${mode}" "${notifier_ids}" "manual"
         return 0
     done < "${TARGETS_DB}"
 }
@@ -1072,6 +1255,7 @@ edit_target() {
         fi
     done < "${TARGETS_DB}"
     mv "${tmp}" "${TARGETS_DB}"
+    clear_target_state "${wanted_id}"
     ok "监控目标已修改。"
 }
 
@@ -1101,6 +1285,7 @@ delete_target() {
         fi
     done < "${TARGETS_DB}"
     mv "${tmp}" "${TARGETS_DB}"
+    [[ "${removed}" == "yes" ]] && clear_target_state "${wanted_id}"
     [[ "${removed}" == "yes" ]] && ok "监控目标已删除。"
 }
 
@@ -1128,6 +1313,7 @@ toggle_target() {
         fi
     done < "${TARGETS_DB}"
     mv "${tmp}" "${TARGETS_DB}"
+    clear_target_state "${wanted_id}"
     ok "目标状态已切换。"
 }
 
