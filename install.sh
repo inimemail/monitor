@@ -17,7 +17,9 @@ LOOP_PID_FILE="${CONFIG_DIR}/monitor-loop.pid"
 CHECK_TIMEOUT="${CHECK_TIMEOUT:-3}"
 ALERT_IP_LIST_LIMIT="${ALERT_IP_LIST_LIMIT:-30}"
 DEFAULT_UPDATE_BASE="https://raw.githubusercontent.com/inimemail/monitor/main"
+DEFAULT_UPDATE_URL="${DEFAULT_UPDATE_BASE}/install.sh"
 UPDATE_URL="${TG_MONITOR_UPDATE_URL:-}"
+INSTALL_PATH="${TG_MONITOR_INSTALL_PATH:-/usr/local/bin/tg-monitor}"
 
 red() { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -56,18 +58,87 @@ get_script_path() {
 }
 
 get_update_url() {
-    local script_path base
     if [[ -n "${UPDATE_URL}" ]]; then
         printf '%s\n' "${UPDATE_URL}"
         return 0
     fi
+    printf '%s\n' "${DEFAULT_UPDATE_URL}"
+}
 
-    script_path="$(get_script_path)"
-    base="$(basename "${script_path}")"
-    case "${base}" in
-        install.sh) printf '%s/install.sh\n' "${DEFAULT_UPDATE_BASE}" ;;
-        *) printf '%s/auto.sh\n' "${DEFAULT_UPDATE_BASE}" ;;
+is_temporary_script_path() {
+    local path="$1"
+    case "${path}" in
+        /dev/fd/*|/proc/*/fd/*|/proc/self/fd/*|*'pipe:['*)
+            return 0
+            ;;
     esac
+    return 1
+}
+
+download_script_to() {
+    local target_path="$1"
+    local update_url tmp target_dir mode
+
+    [[ -n "${target_path}" ]] || { err "安装路径为空，已取消。"; return 1; }
+    update_url="$(get_update_url)"
+    target_dir="$(dirname "${target_path}")"
+    tmp="$(mktemp)"
+
+    if [[ ! -d "${target_dir}" ]]; then
+        mkdir -p "${target_dir}" 2>/dev/null || {
+            rm -f "${tmp}"
+            err "无法创建目录：${target_dir}"
+            return 1
+        }
+    fi
+
+    if [[ -e "${target_path}" && ! -w "${target_path}" ]]; then
+        rm -f "${tmp}"
+        err "当前用户没有写入权限：${target_path}"
+        warn "请用 root/sudo 运行，或设置 TG_MONITOR_INSTALL_PATH 到可写路径。"
+        return 1
+    fi
+
+    info "正在下载最新脚本：${update_url}"
+    if ! curl -fsSL "${update_url}" -o "${tmp}"; then
+        rm -f "${tmp}"
+        err "下载失败，请检查网络或更新地址。"
+        return 1
+    fi
+
+    if ! bash -n "${tmp}"; then
+        rm -f "${tmp}"
+        err "下载到的脚本语法检查未通过，已取消更新。"
+        return 1
+    fi
+
+    mode="$(stat -c '%a' "${target_path}" 2>/dev/null || true)"
+    cp "${tmp}" "${target_path}" || {
+        rm -f "${tmp}"
+        err "写入脚本失败：${target_path}"
+        return 1
+    }
+    rm -f "${tmp}"
+
+    if [[ -n "${mode}" ]]; then
+        chmod "${mode}" "${target_path}" 2>/dev/null || true
+    else
+        chmod +x "${target_path}" 2>/dev/null || true
+    fi
+}
+
+ensure_persistent_script() {
+    local script_path
+
+    SCRIPT_RUN_PATH=""
+    script_path="$(get_script_path)"
+    if is_temporary_script_path "${script_path}" || [[ ! -f "${script_path}" ]]; then
+        warn "当前是临时执行入口，正在安装脚本到固定路径：${INSTALL_PATH}"
+        download_script_to "${INSTALL_PATH}" || return 1
+        SCRIPT_RUN_PATH="${INSTALL_PATH}"
+    else
+        SCRIPT_RUN_PATH="${script_path}"
+    fi
 }
 
 shell_quote() {
@@ -1435,9 +1506,10 @@ setup_cron() {
 
     stop_loop "quiet"
     current="$(cron_without_mark)"
+    ensure_persistent_script || return 1
+    script_path="${SCRIPT_RUN_PATH}"
 
     if [[ "${schedule_type}" == "minute" ]]; then
-        script_path="$(get_script_path)"
         quoted_path="$(shell_quote "${script_path}")"
         cron_cmd="*/${interval} * * * * bash ${quoted_path} --cron >/dev/null 2>&1 ${CRON_MARK}"
         {
@@ -1451,7 +1523,6 @@ setup_cron() {
     if have_crontab; then
         printf '%s\n' "${current}" | crontab -
     fi
-    script_path="$(get_script_path)"
     nohup bash "${script_path}" --loop "${interval}" >/dev/null 2>&1 &
     pid="$!"
     printf '%s\n' "${pid}" > "${LOOP_PID_FILE}"
@@ -1469,54 +1540,23 @@ remove_cron() {
 }
 
 update_self() {
-    local script_path update_url tmp mode
+    local script_path target_path
 
     script_path="$(get_script_path)"
-    update_url="$(get_update_url)"
 
-    case "${script_path}" in
-        /dev/fd/*|/proc/self/fd/*|/tmp/*)
-            err "当前脚本是临时执行入口：${script_path}"
-            warn "请先把脚本安装到固定路径后再更新，例如：curl -fsSL ${update_url} -o /usr/local/bin/tg-monitor && chmod +x /usr/local/bin/tg-monitor"
-            return 1
-            ;;
-    esac
-
-    if [[ ! -f "${script_path}" ]]; then
-        err "找不到当前脚本文件：${script_path}"
-        return 1
-    fi
-
-    if [[ ! -w "${script_path}" ]]; then
-        err "当前用户没有写入权限：${script_path}"
-        warn "请用 root/sudo 运行更新，或手动下载覆盖这个文件。"
-        return 1
-    fi
-
-    tmp="$(mktemp)"
-    info "正在下载最新脚本：${update_url}"
-    if ! curl -fsSL "${update_url}" -o "${tmp}"; then
-        rm -f "${tmp}"
-        err "下载失败，请检查网络或更新地址。"
-        return 1
-    fi
-
-    if ! bash -n "${tmp}"; then
-        rm -f "${tmp}"
-        err "下载到的脚本语法检查未通过，已取消更新。"
-        return 1
-    fi
-
-    mode="$(stat -c '%a' "${script_path}" 2>/dev/null || true)"
-    cp "${tmp}" "${script_path}"
-    rm -f "${tmp}"
-    if [[ -n "${mode}" ]]; then
-        chmod "${mode}" "${script_path}" 2>/dev/null || true
+    if is_temporary_script_path "${script_path}" || [[ ! -f "${script_path}" ]]; then
+        target_path="${INSTALL_PATH}"
+        warn "当前脚本是临时执行入口：${script_path}"
+        info "将安装/更新到固定路径：${target_path}"
     else
-        chmod +x "${script_path}" 2>/dev/null || true
+        target_path="${script_path}"
     fi
 
-    ok "脚本已更新：${script_path}"
+    download_script_to "${target_path}" || return 1
+    ok "脚本已更新：${target_path}"
+    if [[ "${target_path}" == "${INSTALL_PATH}" ]]; then
+        ok "以后可以直接运行：bash ${INSTALL_PATH}"
+    fi
     warn "如果你之前启动了秒级后台巡检，请到“定时巡检设置”里重新设置一次，让后台进程使用新版脚本。"
 }
 
