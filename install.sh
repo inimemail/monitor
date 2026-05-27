@@ -18,6 +18,7 @@ LOOP_PID_FILE="${CONFIG_DIR}/monitor-loop.pid"
 LOOP_INTERVAL_FILE="${CONFIG_DIR}/monitor-loop.interval"
 CHECK_TIMEOUT="${CHECK_TIMEOUT:-3}"
 TCP_CHECK_COUNT="${TCP_CHECK_COUNT:-10}"
+IP_CHECK_CONCURRENCY="${IP_CHECK_CONCURRENCY:-20}"
 ALERT_IP_LIST_LIMIT="${ALERT_IP_LIST_LIMIT:-30}"
 DOMAIN_ALERT_SIGNATURE_MODE="${DOMAIN_ALERT_SIGNATURE_MODE:-summary}"
 DEFAULT_UPDATE_BASE="https://raw.githubusercontent.com/inimemail/monitor/main"
@@ -542,13 +543,37 @@ tcp_check() {
     return 1
 }
 
+check_ip_worker() {
+    local index="$1"
+    local ip="$2"
+    local method="$3"
+    local port="$4"
+    local result_dir="$5"
+    local status="down"
+    local error=""
+
+    if [[ "${method}" == "ping" ]]; then
+        if ping -c 1 -W "${CHECK_TIMEOUT}" "${ip}" >/dev/null 2>&1; then
+            status="up"
+        fi
+    else
+        if tcp_check "${ip}" "${port}"; then
+            status="up"
+        elif [[ -n "${TCP_CHECK_ERROR}" ]]; then
+            error="${TCP_CHECK_ERROR}"
+        fi
+    fi
+
+    printf '%s\t%s\t%s\t%s\n' "${index}" "${status}" "${ip}" "${error}" > "${result_dir}/${index}.tsv"
+}
+
 check_one_target() {
     local name="$1"
     local target="$2"
     local method="$3"
     local port="$4"
     local mode="$5"
-    local ip
+    local ip result_dir concurrency running index result_file status result_ip result_error
 
     CHECK_ERROR=""
     CHECK_ALERT="no"
@@ -573,24 +598,45 @@ check_one_target() {
         fi
     fi
 
+    concurrency="${IP_CHECK_CONCURRENCY:-20}"
+    [[ "${concurrency}" =~ ^[0-9]+$ && "${concurrency}" -ge 1 ]] || concurrency=20
+    result_dir="$(mktemp -d)"
+    index=0
+    running=0
     for ip in "${CHECK_ALL_IPS[@]}"; do
-        if [[ "${method}" == "ping" ]]; then
-            if ping -c 1 -W "${CHECK_TIMEOUT}" "${ip}" >/dev/null 2>&1; then
-                CHECK_UP_IPS+=("${ip}")
+        index=$((index + 1))
+        check_ip_worker "${index}" "${ip}" "${method}" "${port}" "${result_dir}" &
+        running=$((running + 1))
+        if [[ "${running}" -ge "${concurrency}" ]]; then
+            if (( BASH_VERSINFO[0] >= 5 )); then
+                wait -n
+                running=$((running - 1))
             else
-                CHECK_DOWN_IPS+=("${ip}")
-            fi
-        else
-            if tcp_check "${ip}" "${port}"; then
-                CHECK_UP_IPS+=("${ip}")
-            else
-                CHECK_DOWN_IPS+=("${ip}")
-                if [[ -n "${TCP_CHECK_ERROR}" ]]; then
-                    CHECK_ERROR="${TCP_CHECK_ERROR}"
-                fi
+                wait
+                running=0
             fi
         fi
     done
+    wait
+
+    for ((index = 1; index <= ${#CHECK_ALL_IPS[@]}; index++)); do
+        result_file="${result_dir}/${index}.tsv"
+        if [[ ! -s "${result_file}" ]]; then
+            CHECK_DOWN_IPS+=("${CHECK_ALL_IPS[$((index - 1))]}")
+            continue
+        fi
+
+        IFS=$'\t' read -r _ status result_ip result_error < "${result_file}"
+        if [[ "${status}" == "up" ]]; then
+            CHECK_UP_IPS+=("${result_ip}")
+        else
+            CHECK_DOWN_IPS+=("${result_ip}")
+            if [[ -n "${result_error}" ]]; then
+                CHECK_ERROR="${result_error}"
+            fi
+        fi
+    done
+    rm -rf -- "${result_dir}"
 
     if [[ "${mode}" == "ALL" && "${#CHECK_DOWN_IPS[@]}" -eq "${#CHECK_ALL_IPS[@]}" ]]; then
         CHECK_ALERT="yes"
