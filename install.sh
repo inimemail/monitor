@@ -288,6 +288,67 @@ mode_label() {
     esac
 }
 
+notifier_mode_label() {
+    case "$1" in
+        ANY) printf '浠讳竴 IP 涓嶉€氬氨鍛婅' ;;
+        ALL) printf '鍏ㄩ儴 IP 涓嶉€氭墠鍛婅' ;;
+        *) printf '璺熼殢鐩爣绛栫暐' ;;
+    esac
+}
+
+normalize_notifier_mode() {
+    case "$1" in
+        ANY|ALL) printf '%s\n' "$1" ;;
+        *) printf 'INHERIT\n' ;;
+    esac
+}
+
+resolve_notifier_mode() {
+    local target_mode="$1"
+    local notifier_mode="$2"
+    notifier_mode="$(normalize_notifier_mode "${notifier_mode}")"
+    case "${notifier_mode}" in
+        ANY|ALL) printf '%s\n' "${notifier_mode}" ;;
+        *) printf '%s\n' "${target_mode}" ;;
+    esac
+}
+
+normalize_notifier_fields() {
+    if [[ -z "${created:-}" ]]; then
+        created="${alert_mode:-}"
+        alert_mode="INHERIT"
+    fi
+    alert_mode="$(normalize_notifier_mode "${alert_mode:-INHERIT}")"
+}
+
+select_notifier_alert_mode() {
+    local var_name="$1"
+    local current="${2:-INHERIT}"
+    local default_choice choice result
+
+    current="$(normalize_notifier_mode "${current}")"
+    case "${current}" in
+        ANY) default_choice=2 ;;
+        ALL) default_choice=3 ;;
+        *) default_choice=1 ;;
+    esac
+
+    echo "通知策略："
+    echo "  1. 跟随目标策略（默认，保持现有行为）"
+    echo "  2. 任一 IP 不通就告警"
+    echo "  3. 全部 IP 不通才告警"
+    while true; do
+        read_default "请选择" "${default_choice}" choice
+        case "${choice}" in
+            1) result="INHERIT"; break ;;
+            2) result="ANY"; break ;;
+            3) result="ALL"; break ;;
+            *) warn "请输入 1、2 或 3。" ;;
+        esac
+    done
+    printf -v "${var_name}" '%s' "${result}"
+}
+
 status_label() {
     case "$1" in
         yes) printf '启用' ;;
@@ -321,8 +382,9 @@ get_bot_token_by_id() {
 
 get_notifier_name_by_id() {
     local wanted_id="$1"
-    local id name bot_id chat_id type enabled created
-    while IFS=$'\t' read -r id name bot_id chat_id type enabled created; do
+    local id name bot_id chat_id type enabled alert_mode created
+    while IFS=$'\t' read -r id name bot_id chat_id type enabled alert_mode created; do
+        normalize_notifier_fields
         if [[ "${id}" == "${wanted_id}" ]]; then
             printf '%s\n' "${name}"
             return 0
@@ -651,6 +713,19 @@ check_one_target() {
     fi
 }
 
+check_alert_for_mode() {
+    local mode="$1"
+
+    if [[ -n "${CHECK_ERROR:-}" || "${#CHECK_ALL_IPS[@]}" -eq 0 ]]; then
+        return 0
+    fi
+    if [[ "${mode}" == "ALL" ]]; then
+        [[ "${#CHECK_DOWN_IPS[@]}" -gt 0 && "${#CHECK_DOWN_IPS[@]}" -eq "${#CHECK_ALL_IPS[@]}" ]]
+        return $?
+    fi
+    [[ "${#CHECK_DOWN_IPS[@]}" -gt 0 ]]
+}
+
 join_lines() {
     local value
     if [[ "$#" -eq 0 ]]; then
@@ -699,6 +774,54 @@ sorted_csv() {
         return 0
     fi
     printf '%s\n' "$@" | sort -u | awk 'BEGIN { first=1 } { if (!first) printf ","; printf "%s", $0; first=0 }'
+}
+
+signature_field() {
+    local signature="$1"
+    local key="$2"
+    local part
+    local -a parts
+
+    IFS='|' read -r -a parts <<< "${signature}"
+    for part in "${parts[@]}"; do
+        if [[ "${part}" == "${key}="* ]]; then
+            printf '%s' "${part#*=}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+load_signature_down_ips() {
+    local signature="$1"
+    local down_csv
+
+    OLD_DOWN_IPS=()
+    down_csv="$(signature_field "${signature}" "down" 2>/dev/null || true)"
+    [[ -n "${down_csv}" && "${down_csv}" != "-" ]] || return 0
+    IFS=',' read -r -a OLD_DOWN_IPS <<< "${down_csv}"
+}
+
+ip_in_args() {
+    local wanted="$1"
+    shift
+    local value
+    for value in "$@"; do
+        [[ "${value}" == "${wanted}" ]] && return 0
+    done
+    return 1
+}
+
+find_removed_old_down_ips() {
+    local ip
+
+    REMOVED_OLD_DOWN_IPS=()
+    for ip in "${OLD_DOWN_IPS[@]}"; do
+        [[ -n "${ip}" ]] || continue
+        if ! ip_in_args "${ip}" "${CHECK_ALL_IPS[@]}"; then
+            REMOVED_OLD_DOWN_IPS+=("${ip}")
+        fi
+    done
 }
 
 build_alert_signature() {
@@ -763,6 +886,22 @@ set_target_state() {
 }
 
 clear_target_state() {
+    local target_id="$1"
+    local tmp id state signature updated
+
+    tmp="$(mktemp)"
+    while IFS=$'\t' read -r id state signature updated; do
+        [[ -n "${id}" ]] || continue
+        [[ "${id}" == "${target_id}" ]] && continue
+        if [[ "${target_id}" != *:* && ( "${id}" == "${target_id}:ANY" || "${id}" == "${target_id}:ALL" ) ]]; then
+            continue
+        fi
+        printf '%s\t%s\t%s\t%s\n' "${id}" "${state}" "${signature}" "${updated}" >> "${tmp}"
+    done < "${STATES_DB}"
+    mv "${tmp}" "${STATES_DB}"
+}
+
+clear_exact_target_state() {
     local target_id="$1"
     local tmp id state signature updated
 
@@ -841,13 +980,31 @@ build_recovery_message() {
     local port="$4"
     local mode="$5"
     local recovered_from="${6:-}"
+    local previous_signature="${7:-}"
     local method_text down_text up_text all_text target_type recovered_from_text
+    local title_icon title_text status_icon status_text time_label removed_text previous_down_text
 
     method_text="$(method_label "${method}" "${port}")"
     is_ip "${target}" && target_type="IP" || target_type="域名"
+    load_signature_down_ips "${previous_signature}"
+    find_removed_old_down_ips
     down_text="$(join_ip_html "${CHECK_DOWN_IPS[@]}")"
     up_text="$(join_ip_html "${CHECK_UP_IPS[@]}")"
     all_text="$(join_ip_html "${CHECK_ALL_IPS[@]}")"
+    previous_down_text="$(join_ip_html "${OLD_DOWN_IPS[@]}")"
+    removed_text="$(join_ip_html "${REMOVED_OLD_DOWN_IPS[@]}")"
+    title_icon="✅"
+    title_text="恢复通知"
+    status_icon="🟢"
+    status_text="已恢复"
+    time_label="恢复时间"
+    if [[ "${#REMOVED_OLD_DOWN_IPS[@]}" -gt 0 ]]; then
+        title_icon="ℹ️"
+        title_text="解析变更通知"
+        status_icon="ℹ️"
+        status_text="故障 IP 已从解析中移除"
+        time_label="通知时间"
+    fi
     if [[ -n "${recovered_from}" ]]; then
         recovered_from_text="🧾 <b>上次告警时间</b>：<code>$(html_escape "${recovered_from}")</code>"
     else
@@ -855,18 +1012,24 @@ build_recovery_message() {
     fi
 
     cat <<EOF
-<b>✅【恢复通知】$(html_escape "${name}")</b>
+<b>${title_icon}【${title_text}】$(html_escape "${name}")</b>
 <code>━━━━━━━━━━━━━━━━━━━━</code>
 
-🟢 <b>状态</b>：<b>已恢复</b>
+${status_icon} <b>状态</b>：<b>$(html_escape "${status_text}")</b>
 🎯 <b>目标</b>：<code>$(html_escape "${target}")</code>（${target_type}）
 🔎 <b>检测</b>：<code>$(html_escape "${method_text}")</code>
 📌 <b>策略</b>：<code>$(html_escape "$(mode_label "${mode}")")</code>
-🕒 <b>恢复时间</b>：<code>$(html_escape "$(now_ts)")</code>
+🕒 <b>${time_label}</b>：<code>$(html_escape "$(now_ts)")</code>
 ${recovered_from_text}
 
-🔴 <b>故障 IP：${#CHECK_DOWN_IPS[@]}/${#CHECK_ALL_IPS[@]}</b>
+🔴 <b>当前故障 IP：${#CHECK_DOWN_IPS[@]}/${#CHECK_ALL_IPS[@]}</b>
 ${down_text}
+
+🧾 <b>上次故障 IP：${#OLD_DOWN_IPS[@]} 个</b>
+${previous_down_text}
+
+🧹 <b>已移出解析的故障 IP：${#REMOVED_OLD_DOWN_IPS[@]} 个</b>
+${removed_text}
 
 🟢 <b>正常 IP：${#CHECK_UP_IPS[@]}/${#CHECK_ALL_IPS[@]}</b>
 ${up_text}
@@ -903,10 +1066,11 @@ send_telegram() {
 send_to_notifier_id() {
     local wanted_id="$1"
     local text="$2"
-    local id name bot_id chat_id type enabled created token
+    local id name bot_id chat_id type enabled alert_mode created token
     SEND_LAST_STATUS="failed"
-    while IFS=$'\t' read -r id name bot_id chat_id type enabled created; do
+    while IFS=$'\t' read -r id name bot_id chat_id type enabled alert_mode created; do
         [[ "${id}" == "${wanted_id}" ]] || continue
+        normalize_notifier_fields
         if [[ "${enabled}" != "yes" ]]; then
             SEND_LAST_STATUS="skipped"
             return 0
@@ -929,7 +1093,7 @@ send_to_notifier_id() {
 send_to_target_notifiers() {
     local notifier_ids="$1"
     local text="$2"
-    local id name bot_id chat_id type enabled created
+    local id name bot_id chat_id type enabled alert_mode created
     local sent=0 failed=0 skipped=0
 
     SEND_SENT=0
@@ -941,8 +1105,9 @@ send_to_target_notifiers() {
     fi
 
     if [[ "${notifier_ids}" == "all" ]]; then
-        while IFS=$'\t' read -r id name bot_id chat_id type enabled created; do
+        while IFS=$'\t' read -r id name bot_id chat_id type enabled alert_mode created; do
             [[ -n "${id}" ]] || continue
+            normalize_notifier_fields
             send_to_notifier_id "${id}" "${text}" || true
             case "${SEND_LAST_STATUS}" in
                 sent) sent=$((sent + 1)) ;;
@@ -968,6 +1133,76 @@ send_to_target_notifiers() {
     SEND_FAILED="${failed}"
     SEND_SKIPPED="${skipped}"
     [[ "${failed}" -eq 0 && "${sent}" -gt 0 ]]
+}
+
+append_notifier_group() {
+    local var_name="$1"
+    local id="$2"
+    local current
+
+    eval "current=\"\${${var_name}:-}\""
+    if [[ -z "${current}" ]]; then
+        printf -v "${var_name}" '%s' "${id}"
+    else
+        printf -v "${var_name}" '%s,%s' "${current}" "${id}"
+    fi
+}
+
+resolve_target_notifier_groups() {
+    local notifier_ids="$1"
+    local target_mode="$2"
+    local id name bot_id chat_id type enabled alert_mode created effective_mode
+
+    NOTIFIER_GROUP_ANY=""
+    NOTIFIER_GROUP_ALL=""
+    NOTIFIER_GROUP_SKIPPED=0
+
+    if [[ "${notifier_ids}" == "none" || -z "${notifier_ids}" ]]; then
+        NOTIFIER_GROUP_SKIPPED=1
+        return 0
+    fi
+
+    if [[ "${notifier_ids}" == "all" ]]; then
+        while IFS=$'\t' read -r id name bot_id chat_id type enabled alert_mode created; do
+            [[ -n "${id}" ]] || continue
+            normalize_notifier_fields
+            if [[ "${enabled}" != "yes" ]]; then
+                NOTIFIER_GROUP_SKIPPED=$((NOTIFIER_GROUP_SKIPPED + 1))
+                continue
+            fi
+            effective_mode="$(resolve_notifier_mode "${target_mode}" "${alert_mode}")"
+            if [[ "${effective_mode}" == "ALL" ]]; then
+                append_notifier_group NOTIFIER_GROUP_ALL "${id}"
+            else
+                append_notifier_group NOTIFIER_GROUP_ANY "${id}"
+            fi
+        done < "${NOTIFIERS_DB}"
+        return 0
+    fi
+
+    IFS=',' read -r -a ids <<< "${notifier_ids}"
+    for id in "${ids[@]}"; do
+        id="$(clean_field "${id}")"
+        [[ -n "${id}" ]] || continue
+        local found="no"
+        while IFS=$'\t' read -r row_id name bot_id chat_id type enabled alert_mode created; do
+            [[ "${row_id}" == "${id}" ]] || continue
+            found="yes"
+            normalize_notifier_fields
+            if [[ "${enabled}" != "yes" ]]; then
+                NOTIFIER_GROUP_SKIPPED=$((NOTIFIER_GROUP_SKIPPED + 1))
+                break
+            fi
+            effective_mode="$(resolve_notifier_mode "${target_mode}" "${alert_mode}")"
+            if [[ "${effective_mode}" == "ALL" ]]; then
+                append_notifier_group NOTIFIER_GROUP_ALL "${id}"
+            else
+                append_notifier_group NOTIFIER_GROUP_ANY "${id}"
+            fi
+            break
+        done < "${NOTIFIERS_DB}"
+        [[ "${found}" == "yes" ]] || NOTIFIER_GROUP_SKIPPED=$((NOTIFIER_GROUP_SKIPPED + 1))
+    done
 }
 
 print_send_result() {
@@ -1021,7 +1256,7 @@ handle_check_notification() {
 
     if [[ "${STATE_STATUS}" == "alert" ]]; then
         old_updated="${STATE_UPDATED:-}"
-        msg="$(build_recovery_message "${name}" "${target}" "${method}" "${port}" "${mode}" "${old_updated}")"
+        msg="$(build_recovery_message "${name}" "${target}" "${method}" "${port}" "${mode}" "${old_updated}" "${STATE_SIGNATURE}")"
         send_to_target_notifiers "${notifier_ids}" "${msg}" || true
         clear_target_state "${target_id}"
 
@@ -1034,6 +1269,94 @@ handle_check_notification() {
     fi
 
     [[ "${run_mode}" == "manual" ]] && ok "[${name}] 正常：${#CHECK_UP_IPS[@]}/${#CHECK_ALL_IPS[@]} 可达。"
+}
+
+handle_check_notification_for_mode() {
+    local target_id="$1"
+    local name="$2"
+    local target="$3"
+    local method="$4"
+    local port="$5"
+    local mode="$6"
+    local notifier_ids="$7"
+    local run_mode="${8:-manual}"
+    local state_id="${target_id}:${mode}"
+    local signature msg old_updated
+
+    NOTIFY_EVENT="none"
+    NOTIFY_SENT=0
+    NOTIFY_FAILED=0
+    NOTIFY_SKIPPED=0
+
+    get_target_state "${state_id}" || true
+    if [[ -z "${STATE_STATUS}" && "${LEGACY_STATE_STATUS:-}" == "alert" ]]; then
+        STATE_STATUS="${LEGACY_STATE_STATUS}"
+        STATE_SIGNATURE="${LEGACY_STATE_SIGNATURE:-}"
+        STATE_UPDATED="${LEGACY_STATE_UPDATED:-}"
+        set_target_state "${state_id}" "${STATE_STATUS}" "${STATE_SIGNATURE}" >/dev/null 2>&1 || true
+    fi
+
+    if [[ -z "${notifier_ids}" ]]; then
+        [[ "${STATE_STATUS}" == "alert" ]] && clear_target_state "${state_id}"
+        return 0
+    fi
+
+    if check_alert_for_mode "${mode}"; then
+        signature="$(build_alert_signature "${target}" "${method}" "${port}" "${mode}")"
+        if [[ "${STATE_STATUS}" == "alert" && "${STATE_SIGNATURE}" == "${signature}" ]]; then
+            NOTIFY_EVENT="duplicate"
+            [[ "${run_mode}" == "manual" ]] && warn "[${name}] $(mode_label "${mode}") 告警未变化，已跳过重复通知。"
+            return 0
+        fi
+
+        msg="$(build_alert_message "${name}" "${target}" "${method}" "${port}" "${mode}")"
+        send_to_target_notifiers "${notifier_ids}" "${msg}" || true
+        set_target_state "${state_id}" "alert" "${signature}"
+
+        NOTIFY_EVENT="alert"
+        NOTIFY_SENT="${SEND_SENT:-0}"
+        NOTIFY_FAILED="${SEND_FAILED:-0}"
+        NOTIFY_SKIPPED="${SEND_SKIPPED:-0}"
+        [[ "${run_mode}" == "manual" ]] && print_send_result "[${name}] $(mode_label "${mode}") "
+        return 0
+    fi
+
+    if [[ "${STATE_STATUS}" == "alert" ]]; then
+        old_updated="${STATE_UPDATED:-}"
+        msg="$(build_recovery_message "${name}" "${target}" "${method}" "${port}" "${mode}" "${old_updated}" "${STATE_SIGNATURE}")"
+        send_to_target_notifiers "${notifier_ids}" "${msg}" || true
+        clear_target_state "${state_id}"
+
+        NOTIFY_EVENT="recovery"
+        NOTIFY_SENT="${SEND_SENT:-0}"
+        NOTIFY_FAILED="${SEND_FAILED:-0}"
+        NOTIFY_SKIPPED="${SEND_SKIPPED:-0}"
+        [[ "${run_mode}" == "manual" ]] && print_send_result "[${name}] $(mode_label "${mode}") 恢复"
+        return 0
+    fi
+
+    [[ "${run_mode}" == "manual" ]] && ok "[${name}] $(mode_label "${mode}") 正常：${#CHECK_UP_IPS[@]}/${#CHECK_ALL_IPS[@]} 可达。"
+}
+
+accumulate_notify_result() {
+    case "${NOTIFY_EVENT}" in
+        alert)
+            alerts=$((alerts + 1))
+            sent_total=$((sent_total + ${NOTIFY_SENT:-0}))
+            failed_total=$((failed_total + ${NOTIFY_FAILED:-0}))
+            skipped_total=$((skipped_total + ${NOTIFY_SKIPPED:-0}))
+            ;;
+        recovery)
+            recoveries=$((recoveries + 1))
+            sent_total=$((sent_total + ${NOTIFY_SENT:-0}))
+            failed_total=$((failed_total + ${NOTIFY_FAILED:-0}))
+            skipped_total=$((skipped_total + ${NOTIFY_SKIPPED:-0}))
+            ;;
+        duplicate)
+            alerts=$((alerts + 1))
+            duplicates=$((duplicates + 1))
+            ;;
+    esac
 }
 
 run_checks() {
@@ -1057,25 +1380,24 @@ run_checks() {
 
         check_one_target "${name}" "${target}" "${method}" "${port}" "${mode}"
 
-        handle_check_notification "${id}" "${name}" "${target}" "${method}" "${port}" "${mode}" "${notifier_ids}" "${run_mode}"
-        case "${NOTIFY_EVENT}" in
-            alert)
-                alerts=$((alerts + 1))
-                sent_total=$((sent_total + ${NOTIFY_SENT:-0}))
-                failed_total=$((failed_total + ${NOTIFY_FAILED:-0}))
-                skipped_total=$((skipped_total + ${NOTIFY_SKIPPED:-0}))
-                ;;
-            recovery)
-                recoveries=$((recoveries + 1))
-                sent_total=$((sent_total + ${NOTIFY_SENT:-0}))
-                failed_total=$((failed_total + ${NOTIFY_FAILED:-0}))
-                skipped_total=$((skipped_total + ${NOTIFY_SKIPPED:-0}))
-                ;;
-            duplicate)
-                alerts=$((alerts + 1))
-                duplicates=$((duplicates + 1))
-                ;;
-        esac
+        resolve_target_notifier_groups "${notifier_ids}" "${mode}"
+        skipped_total=$((skipped_total + ${NOTIFIER_GROUP_SKIPPED:-0}))
+        LEGACY_STATE_STATUS=""
+        LEGACY_STATE_SIGNATURE=""
+        LEGACY_STATE_UPDATED=""
+        if get_target_state "${id}"; then
+            LEGACY_STATE_STATUS="${STATE_STATUS}"
+            LEGACY_STATE_SIGNATURE="${STATE_SIGNATURE}"
+            LEGACY_STATE_UPDATED="${STATE_UPDATED}"
+        fi
+
+        handle_check_notification_for_mode "${id}" "${name}" "${target}" "${method}" "${port}" "ANY" "${NOTIFIER_GROUP_ANY}" "${run_mode}"
+        accumulate_notify_result
+
+        handle_check_notification_for_mode "${id}" "${name}" "${target}" "${method}" "${port}" "ALL" "${NOTIFIER_GROUP_ALL}" "${run_mode}"
+        accumulate_notify_result
+
+        [[ -n "${LEGACY_STATE_STATUS}" ]] && clear_exact_target_state "${id}"
     done < "${TARGETS_DB}"
 
     if [[ "${run_mode}" == "manual" ]]; then
@@ -1250,7 +1572,18 @@ run_one_target() {
         [[ "${enabled}" == "yes" ]] || warn "该目标当前是停用状态，本次仍会手动检测一次。"
         info "正在检测 [${name}] ${target} ($(method_label "${method}" "${port}"))"
         check_one_target "${name}" "${target}" "${method}" "${port}" "${mode}"
-        handle_check_notification "${id}" "${name}" "${target}" "${method}" "${port}" "${mode}" "${notifier_ids}" "manual"
+        resolve_target_notifier_groups "${notifier_ids}" "${mode}"
+        LEGACY_STATE_STATUS=""
+        LEGACY_STATE_SIGNATURE=""
+        LEGACY_STATE_UPDATED=""
+        if get_target_state "${id}"; then
+            LEGACY_STATE_STATUS="${STATE_STATUS}"
+            LEGACY_STATE_SIGNATURE="${STATE_SIGNATURE}"
+            LEGACY_STATE_UPDATED="${STATE_UPDATED}"
+        fi
+        handle_check_notification_for_mode "${id}" "${name}" "${target}" "${method}" "${port}" "ANY" "${NOTIFIER_GROUP_ANY}" "manual"
+        handle_check_notification_for_mode "${id}" "${name}" "${target}" "${method}" "${port}" "ALL" "${NOTIFIER_GROUP_ALL}" "manual"
+        [[ -n "${LEGACY_STATE_STATUS}" ]] && clear_exact_target_state "${id}"
         return 0
     done < "${TARGETS_DB}"
 }
@@ -1656,6 +1989,172 @@ test_notifier() {
     else
         err "测试通知发送失败，请检查 Bot Token、Chat ID、机器人权限或服务器网络。"
     fi
+}
+
+bot_is_used() {
+    local wanted_id="$1"
+    local id name bot_id chat_id type enabled alert_mode created
+    while IFS=$'\t' read -r id name bot_id chat_id type enabled alert_mode created; do
+        normalize_notifier_fields
+        [[ "${bot_id}" == "${wanted_id}" ]] && return 0
+    done < "${NOTIFIERS_DB}"
+    return 1
+}
+
+list_notifiers() {
+    ensure_data
+    if [[ ! -s "${NOTIFIERS_DB}" ]]; then
+        warn "当前没有通知位置。"
+        return 0
+    fi
+
+    local seq=1 id name bot_id chat_id type enabled alert_mode created bot_name
+    printf '\n%-4s %-6s %-18s %-16s %-24s %-12s %-18s %s\n' "序号" "状态" "名称" "机器人" "Chat ID / @频道" "类型" "通知策略" "创建日期"
+    printf '%s\n' "------------------------------------------------------------------------------------------------------------------------"
+    while IFS=$'\t' read -r id name bot_id chat_id type enabled alert_mode created; do
+        [[ -n "${id}" ]] || continue
+        normalize_notifier_fields
+        bot_name="$(get_bot_name_by_id "${bot_id}")"
+        printf '%-4s %-6s %-18s %-16s %-24s %-12s %-18s %s\n' "${seq}" "$(status_label "${enabled}")" "${name}" "${bot_name}" "${chat_id}" "${type}" "$(notifier_mode_label "${alert_mode}")" "$(short_date "${created}")"
+        seq=$((seq + 1))
+    done < "${NOTIFIERS_DB}"
+}
+
+add_notifier() {
+    ensure_data
+    local name bot_id chat_id type_choice type alert_mode id created
+    echo
+    blue "新增通知位置"
+    select_bot_id bot_id || return 1
+    read_required "通知位置名称，例如 admin、ops-group、notice-channel" name
+    echo "位置类型："
+    echo "  1. 私聊/用户"
+    echo "  2. 群组/超级群"
+    echo "  3. 频道"
+    while true; do
+        read_default "请选择" "1" type_choice
+        case "${type_choice}" in
+            1) type="私聊"; break ;;
+            2) type="群组"; break ;;
+            3) type="频道"; break ;;
+            *) warn "请输入 1、2 或 3。" ;;
+        esac
+    done
+    select_notifier_alert_mode alert_mode "INHERIT"
+    read_required "Chat ID 或 @频道用户名。群/频道请确保机器人已加入并有发言权限" chat_id
+    id="$(next_id "${NOTIFIERS_DB}")"
+    created="$(now_ts)"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${id}" "${name}" "${bot_id}" "${chat_id}" "${type}" "yes" "${alert_mode}" "${created}" >> "${NOTIFIERS_DB}"
+    ok "通知位置已添加。"
+}
+
+edit_notifier() {
+    ensure_data
+    if [[ ! -s "${NOTIFIERS_DB}" ]]; then
+        warn "当前没有可修改的通知位置。"
+        return 0
+    fi
+
+    list_notifiers
+    local seq wanted_id tmp
+    read_required "请输入要修改的通知位置序号" seq
+    [[ "${seq}" =~ ^[0-9]+$ ]] || { warn "请输入数字序号。"; return 1; }
+    wanted_id="$(get_id_by_seq "${NOTIFIERS_DB}" "${seq}")" || { warn "没有这个序号。"; return 1; }
+
+    tmp="$(mktemp)"
+    local id name bot_id chat_id type enabled alert_mode created
+    local new_name new_bot_id new_chat_id new_type_choice new_type new_type_choice_default new_alert_mode
+    while IFS=$'\t' read -r id name bot_id chat_id type enabled alert_mode created; do
+        [[ -n "${id}" ]] || continue
+        normalize_notifier_fields
+        if [[ "${id}" == "${wanted_id}" ]]; then
+            read_default "通知位置名称" "${name}" new_name
+            if confirm "是否更换机器人"; then
+                select_bot_id new_bot_id || new_bot_id="${bot_id}"
+            else
+                new_bot_id="${bot_id}"
+            fi
+            read_default "Chat ID 或 @频道用户名" "${chat_id}" new_chat_id
+            echo "位置类型：1. 私聊/用户  2. 群组/超级群  3. 频道"
+            case "${type}" in
+                群组) new_type_choice_default=2 ;;
+                频道) new_type_choice_default=3 ;;
+                *) new_type_choice_default=1 ;;
+            esac
+            read_default "请选择" "${new_type_choice_default}" new_type_choice
+            case "${new_type_choice}" in
+                2) new_type="群组" ;;
+                3) new_type="频道" ;;
+                *) new_type="私聊" ;;
+            esac
+            select_notifier_alert_mode new_alert_mode "${alert_mode}"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${id}" "${new_name}" "${new_bot_id}" "${new_chat_id}" "${new_type}" "${enabled}" "${new_alert_mode}" "${created}" >> "${tmp}"
+        else
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${id}" "${name}" "${bot_id}" "${chat_id}" "${type}" "${enabled}" "${alert_mode}" "${created}" >> "${tmp}"
+        fi
+    done < "${NOTIFIERS_DB}"
+    mv "${tmp}" "${NOTIFIERS_DB}"
+    ok "通知位置已修改。"
+}
+
+delete_notifier() {
+    ensure_data
+    if [[ ! -s "${NOTIFIERS_DB}" ]]; then
+        warn "当前没有可删除的通知位置。"
+        return 0
+    fi
+
+    list_notifiers
+    local seq wanted_id tmp removed="no"
+    read_required "请输入要删除的通知位置序号，输入 0 取消" seq
+    [[ "${seq}" =~ ^[0-9]+$ ]] || { warn "请输入数字序号。"; return 1; }
+    [[ "${seq}" -eq 0 ]] && return 0
+    wanted_id="$(get_id_by_seq "${NOTIFIERS_DB}" "${seq}")" || { warn "没有这个序号。"; return 1; }
+
+    tmp="$(mktemp)"
+    local id name bot_id chat_id type enabled alert_mode created
+    while IFS=$'\t' read -r id name bot_id chat_id type enabled alert_mode created; do
+        [[ -n "${id}" ]] || continue
+        normalize_notifier_fields
+        if [[ "${id}" == "${wanted_id}" ]]; then
+            removed="yes"
+            info "已删除通知位置：${name}"
+        else
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${id}" "${name}" "${bot_id}" "${chat_id}" "${type}" "${enabled}" "${alert_mode}" "${created}" >> "${tmp}"
+        fi
+    done < "${NOTIFIERS_DB}"
+    mv "${tmp}" "${NOTIFIERS_DB}"
+    remove_notifier_from_target_lists "${wanted_id}"
+    [[ "${removed}" == "yes" ]] && ok "通知位置已删除。"
+}
+
+toggle_notifier() {
+    ensure_data
+    if [[ ! -s "${NOTIFIERS_DB}" ]]; then
+        warn "当前没有可操作的通知位置。"
+        return 0
+    fi
+
+    list_notifiers
+    local seq wanted_id tmp
+    read_required "请输入要启用/停用的通知位置序号" seq
+    [[ "${seq}" =~ ^[0-9]+$ ]] || { warn "请输入数字序号。"; return 1; }
+    wanted_id="$(get_id_by_seq "${NOTIFIERS_DB}" "${seq}")" || { warn "没有这个序号。"; return 1; }
+
+    tmp="$(mktemp)"
+    local id name bot_id chat_id type enabled alert_mode created new_enabled
+    while IFS=$'\t' read -r id name bot_id chat_id type enabled alert_mode created; do
+        [[ -n "${id}" ]] || continue
+        normalize_notifier_fields
+        if [[ "${id}" == "${wanted_id}" ]]; then
+            [[ "${enabled}" == "yes" ]] && new_enabled="no" || new_enabled="yes"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${id}" "${name}" "${bot_id}" "${chat_id}" "${type}" "${new_enabled}" "${alert_mode}" "${created}" >> "${tmp}"
+        else
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${id}" "${name}" "${bot_id}" "${chat_id}" "${type}" "${enabled}" "${alert_mode}" "${created}" >> "${tmp}"
+        fi
+    done < "${NOTIFIERS_DB}"
+    mv "${tmp}" "${NOTIFIERS_DB}"
+    ok "通知位置状态已切换。"
 }
 
 stop_loop() {
@@ -2172,4 +2671,3 @@ main() {
 }
 
 main "$@"
-
