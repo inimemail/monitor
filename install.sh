@@ -172,7 +172,7 @@ read_required() {
     local var_name="$2"
     local value
     while true; do
-        read -r -p "${prompt}: " value
+        read -r -p "${prompt}: " value || return 1
         value="$(clean_field "${value}")"
         if [[ -n "${value}" ]]; then
             printf -v "${var_name}" '%s' "${value}"
@@ -291,9 +291,9 @@ mode_label() {
 
 notifier_mode_label() {
     case "$1" in
-        ANY) printf '浠讳竴 IP 涓嶉€氬氨鍛婅' ;;
-        ALL) printf '鍏ㄩ儴 IP 涓嶉€氭墠鍛婅' ;;
-        *) printf '璺熼殢鐩爣绛栫暐' ;;
+        ANY) printf '任一 IP 不通就告警' ;;
+        ALL) printf '全部 IP 不通才告警' ;;
+        *) printf '跟随目标策略' ;;
     esac
 }
 
@@ -1796,39 +1796,118 @@ edit_target() {
     [[ "${seq}" =~ ^[0-9]+$ ]] || { warn "请输入数字序号。"; return 1; }
     wanted_id="$(get_id_by_seq "${TARGETS_DB}" "${seq}")" || { warn "没有这个序号。"; return 1; }
 
-    tmp="$(mktemp)"
     local id name target method port mode notifier_ids enabled created
-    local new_name new_target new_method_choice new_method new_port new_mode_choice new_mode new_notifier_ids
+    local new_name new_target new_method_choice new_method new_port new_mode_choice new_mode new_notifier_ids new_enabled
+    local edit_choice saved="no" found="no"
     while IFS=$'\t' read -r id name target method port mode notifier_ids enabled created; do
-        if [[ "${id}" == "${wanted_id}" ]]; then
-            read_default "目标名称" "${name}" new_name
-            while true; do
-                read_default "域名或 IP" "${target}" new_target
-                new_target="$(printf '%s' "${new_target}" | tr 'A-Z' 'a-z')"
-                valid_target "${new_target}" && break
-                warn "格式不正确，请重新输入。"
-            done
+        [[ "${id}" == "${wanted_id}" ]] || continue
+        found="yes"
+        break
+    done < "${TARGETS_DB}"
 
-            echo "检测方式：1. Ping  2. TCP 端口"
-            read_default "请选择" "$([[ "${method}" == "tcp" ]] && echo 2 || echo 1)" new_method_choice
-            if [[ "${new_method_choice}" == "2" ]]; then
-                new_method="tcp"
+    [[ "${found}" == "yes" ]] || { warn "没有这个目标。"; return 1; }
+
+    new_name="${name}"
+    new_target="${target}"
+    new_method="${method}"
+    new_port="${port}"
+    new_mode="${mode}"
+    new_notifier_ids="${notifier_ids}"
+    new_enabled="${enabled}"
+
+    while true; do
+        echo
+        blue "修改监控目标：${new_name}"
+        printf '  1. 目标名称：%s\n' "${new_name}"
+        printf '  2. 域名/IP：%s\n' "${new_target}"
+        printf '  3. 检测方式：%s\n' "$(method_label "${new_method}" "${new_port}")"
+        printf '  4. 告警策略：%s\n' "$(mode_label "${new_mode}")"
+        printf '  5. 通知位置：%s\n' "$(describe_notifier_ids "${new_notifier_ids}")"
+        printf '  6. 状态：%s\n' "$(status_label "${new_enabled}")"
+        echo "  s. 保存修改"
+        echo "  0. 取消修改"
+        read_required "请选择要修改的项目" edit_choice || { saved="no"; break; }
+
+        case "${edit_choice}" in
+            1)
+                read_default "目标名称" "${new_name}" new_name
+                ;;
+            2)
                 while true; do
-                    read_default "TCP 端口" "${port}" new_port
-                    valid_port "${new_port}" && break
-                    warn "端口必须是 1-65535 的数字。"
+                    read_default "域名或 IP" "${new_target}" new_target
+                    new_target="$(printf '%s' "${new_target}" | tr 'A-Z' 'a-z')"
+                    valid_target "${new_target}" && break
+                    warn "格式不正确，请重新输入。"
                 done
-            else
-                new_method="ping"
-                new_port="0"
-            fi
+                ;;
+            3)
+                echo "检测方式：1. Ping  2. TCP 端口"
+                while true; do
+                    read_default "请选择" "$([[ "${new_method}" == "tcp" ]] && echo 2 || echo 1)" new_method_choice
+                    case "${new_method_choice}" in
+                        1)
+                            new_method="ping"
+                            new_port="0"
+                            break
+                            ;;
+                        2)
+                            new_method="tcp"
+                            while true; do
+                                read_default "TCP 端口" "$([[ "${new_port}" == "0" ]] && echo 443 || echo "${new_port}")" new_port
+                                valid_port "${new_port}" && break
+                                warn "端口必须是 1-65535 的数字。"
+                            done
+                            break
+                            ;;
+                        *) warn "请输入 1 或 2。" ;;
+                    esac
+                done
+                ;;
+            4)
+                echo "告警策略：1. 任一 IP 不通就告警  2. 全部 IP 不通才告警"
+                while true; do
+                    read_default "请选择" "$([[ "${new_mode}" == "ALL" ]] && echo 2 || echo 1)" new_mode_choice
+                    case "${new_mode_choice}" in
+                        1) new_mode="ANY"; break ;;
+                        2) new_mode="ALL"; break ;;
+                        *) warn "请输入 1 或 2。" ;;
+                    esac
+                done
+                ;;
+            5)
+                select_notifier_ids new_notifier_ids "${new_notifier_ids}"
+                ;;
+            6)
+                if [[ "${new_enabled}" == "yes" ]]; then
+                    new_enabled="no"
+                else
+                    new_enabled="yes"
+                fi
+                ;;
+            s|S)
+                saved="yes"
+                break
+                ;;
+            0)
+                saved="no"
+                break
+                ;;
+            *)
+                warn "请输入 1-6、s 或 0。"
+                ;;
+        esac
+    done
 
-            echo "告警策略：1. 任一 IP 不通就告警  2. 全部 IP 不通才告警"
-            read_default "请选择" "$([[ "${mode}" == "ALL" ]] && echo 2 || echo 1)" new_mode_choice
-            [[ "${new_mode_choice}" == "2" ]] && new_mode="ALL" || new_mode="ANY"
+    if [[ "${saved}" != "yes" ]]; then
+        warn "已取消修改。"
+        return 0
+    fi
 
-            select_notifier_ids new_notifier_ids "${notifier_ids}"
-            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${id}" "${new_name}" "${new_target}" "${new_method}" "${new_port}" "${new_mode}" "${new_notifier_ids}" "${enabled}" "${created}" >> "${tmp}"
+    tmp="$(mktemp)"
+    while IFS=$'\t' read -r id name target method port mode notifier_ids enabled created; do
+        [[ -n "${id}" ]] || continue
+        if [[ "${id}" == "${wanted_id}" ]]; then
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${id}" "${new_name}" "${new_target}" "${new_method}" "${new_port}" "${new_mode}" "${new_notifier_ids}" "${new_enabled}" "${created}" >> "${tmp}"
         else
             printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${id}" "${name}" "${target}" "${method}" "${port}" "${mode}" "${notifier_ids}" "${enabled}" "${created}" >> "${tmp}"
         fi
