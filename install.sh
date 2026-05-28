@@ -17,6 +17,7 @@ CRON_MARK="# tg-monitor-auto"
 LOOP_PID_FILE="${CONFIG_DIR}/monitor-loop.pid"
 LOOP_INTERVAL_FILE="${CONFIG_DIR}/monitor-loop.interval"
 CHECK_TIMEOUT="${CHECK_TIMEOUT:-3}"
+PING_CHECK_COUNT="${PING_CHECK_COUNT:-10}"
 TCP_CHECK_COUNT="${TCP_CHECK_COUNT:-10}"
 TCP_CHECK_INTERVAL_US="${TCP_CHECK_INTERVAL_US:-200000}"
 TCP_CHECK_TOTAL_TIMEOUT="${TCP_CHECK_TOTAL_TIMEOUT:-}"
@@ -611,6 +612,55 @@ tcp_check() {
     return 1
 }
 
+ping_check() {
+    local host="$1"
+    local count="${PING_CHECK_COUNT:-10}"
+    local result_dir pid status_file index
+    local any_running
+    local -a pids=()
+
+    [[ "${count}" =~ ^[0-9]+$ && "${count}" -ge 1 ]] || count=10
+    result_dir="$(mktemp -d)"
+    status_file="${result_dir}/ok"
+
+    for ((index = 1; index <= count; index++)); do
+        (
+            if ping -c 1 -W "${CHECK_TIMEOUT}" "${host}" >/dev/null 2>&1; then
+                printf 'ok\n' > "${status_file}"
+            fi
+        ) &
+        pids+=("$!")
+    done
+
+    while true; do
+        if [[ -s "${status_file}" ]]; then
+            for pid in "${pids[@]}"; do
+                kill "${pid}" 2>/dev/null || true
+            done
+            wait 2>/dev/null || true
+            rm -rf -- "${result_dir}"
+            return 0
+        fi
+
+        any_running="no"
+        for pid in "${pids[@]}"; do
+            if kill -0 "${pid}" 2>/dev/null; then
+                any_running="yes"
+                break
+            fi
+        done
+        [[ "${any_running}" == "yes" ]] || break
+        sleep 0.05
+    done
+
+    if [[ -s "${status_file}" ]]; then
+        rm -rf -- "${result_dir}"
+        return 0
+    fi
+    rm -rf -- "${result_dir}"
+    return 1
+}
+
 check_ip_worker() {
     local index="$1"
     local ip="$2"
@@ -621,7 +671,7 @@ check_ip_worker() {
     local error=""
 
     if [[ "${method}" == "ping" ]]; then
-        if ping -c 1 -W "${CHECK_TIMEOUT}" "${ip}" >/dev/null 2>&1; then
+        if ping_check "${ip}"; then
             status="up"
         fi
     else
@@ -824,6 +874,41 @@ find_removed_old_down_ips() {
     done
 }
 
+load_signature_all_ips() {
+    local signature="$1"
+    local all_csv
+
+    OLD_ALL_IPS=()
+    all_csv="$(signature_field "${signature}" "all" 2>/dev/null || true)"
+    [[ -n "${all_csv}" && "${all_csv}" != "-" ]] || return 0
+    IFS=',' read -r -a OLD_ALL_IPS <<< "${all_csv}"
+}
+
+find_resolved_ip_changes() {
+    local ip
+
+    ADDED_RESOLVED_IPS=()
+    REMOVED_RESOLVED_IPS=()
+    for ip in "${CHECK_ALL_IPS[@]}"; do
+        [[ -n "${ip}" ]] || continue
+        if ! ip_in_args "${ip}" "${OLD_ALL_IPS[@]}"; then
+            ADDED_RESOLVED_IPS+=("${ip}")
+        fi
+    done
+    for ip in "${OLD_ALL_IPS[@]}"; do
+        [[ -n "${ip}" ]] || continue
+        if ! ip_in_args "${ip}" "${CHECK_ALL_IPS[@]}"; then
+            REMOVED_RESOLVED_IPS+=("${ip}")
+        fi
+    done
+}
+
+build_dns_signature() {
+    local all_ips
+    all_ips="$(sorted_csv "${CHECK_ALL_IPS[@]}")"
+    printf 'target=dns|all=%s' "${all_ips}"
+}
+
 build_alert_signature() {
     local target="$1"
     local method="$2"
@@ -844,7 +929,8 @@ build_alert_signature() {
 
     if is_domain "${target}" && [[ "${DOMAIN_ALERT_SIGNATURE_MODE}" != "strict" ]]; then
         down_ips="$(sorted_csv "${CHECK_DOWN_IPS[@]}")"
-        printf 'target=domain|method=%s|port=%s|mode=%s|status=%s|down=%s' "${method}" "${port}" "${mode}" "${status_key}" "${down_ips}"
+        all_ips="$(sorted_csv "${CHECK_ALL_IPS[@]}")"
+        printf 'target=domain|method=%s|port=%s|mode=%s|status=%s|down=%s|all=%s' "${method}" "${port}" "${mode}" "${status_key}" "${down_ips}" "${all_ips}"
         return 0
     fi
 
@@ -1039,6 +1125,49 @@ ${all_text}
 EOF
 }
 
+build_dns_change_message() {
+    local name="$1"
+    local target="$2"
+    local method="$3"
+    local port="$4"
+    local previous_updated="${5:-}"
+    local method_text added_text removed_text old_text current_text previous_text
+
+    method_text="$(method_label "${method}" "${port}")"
+    added_text="$(join_ip_html "${ADDED_RESOLVED_IPS[@]}")"
+    removed_text="$(join_ip_html "${REMOVED_RESOLVED_IPS[@]}")"
+    old_text="$(join_ip_html "${OLD_ALL_IPS[@]}")"
+    current_text="$(join_ip_html "${CHECK_ALL_IPS[@]}")"
+    if [[ -n "${previous_updated}" ]]; then
+        previous_text="🧾 <b>上次解析记录时间</b>：<code>$(html_escape "${previous_updated}")</code>"
+    else
+        previous_text="🧾 <b>上次解析记录时间</b>：<code>未知</code>"
+    fi
+
+    cat <<EOF
+<b>ℹ️【解析变更通知】$(html_escape "${name}")</b>
+<code>━━━━━━━━━━━━━━━━━━━━</code>
+
+ℹ️ <b>状态</b>：<b>域名解析 IP 发生变化</b>
+🎯 <b>目标</b>：<code>$(html_escape "${target}")</code>（域名）
+🔎 <b>检测</b>：<code>$(html_escape "${method_text}")</code>
+🕒 <b>通知时间</b>：<code>$(html_escape "$(now_ts)")</code>
+${previous_text}
+
+🆕 <b>新增解析 IP：${#ADDED_RESOLVED_IPS[@]} 个</b>
+${added_text}
+
+🧹 <b>移除解析 IP：${#REMOVED_RESOLVED_IPS[@]} 个</b>
+${removed_text}
+
+🌐 <b>本次解析：${#CHECK_ALL_IPS[@]} 个</b>
+${current_text}
+
+🧾 <b>上次解析：${#OLD_ALL_IPS[@]} 个</b>
+${old_text}
+EOF
+}
+
 build_test_message() {
     cat <<EOF
 <b>✅【测试通知】$(html_escape "${APP_NAME}")</b>
@@ -1216,6 +1345,61 @@ print_send_result() {
     fi
 }
 
+handle_dns_change_notification() {
+    local target_id="$1"
+    local name="$2"
+    local target="$3"
+    local method="$4"
+    local port="$5"
+    local notifier_ids="$6"
+    local run_mode="${7:-manual}"
+    local state_id="${target_id}:DNS"
+    local current_signature msg previous_updated
+
+    DNS_NOTIFY_EVENT="none"
+    DNS_NOTIFY_SENT=0
+    DNS_NOTIFY_FAILED=0
+    DNS_NOTIFY_SKIPPED=0
+
+    is_domain "${target}" || return 0
+    [[ -z "${CHECK_ERROR:-}" && "${#CHECK_ALL_IPS[@]}" -gt 0 ]] || return 0
+    current_signature="$(build_dns_signature)"
+    get_target_state "${state_id}" || true
+
+    if [[ -z "${STATE_STATUS}" ]]; then
+        set_target_state "${state_id}" "ok" "${current_signature}"
+        return 0
+    fi
+
+    if [[ "${STATE_SIGNATURE}" == "${current_signature}" ]]; then
+        return 0
+    fi
+
+    load_signature_all_ips "${STATE_SIGNATURE}"
+    find_resolved_ip_changes
+    previous_updated="${STATE_UPDATED:-}"
+    set_target_state "${state_id}" "ok" "${current_signature}"
+
+    if [[ "${#ADDED_RESOLVED_IPS[@]}" -eq 0 && "${#REMOVED_RESOLVED_IPS[@]}" -eq 0 ]]; then
+        return 0
+    fi
+
+    if [[ "${notifier_ids}" == "none" || -z "${notifier_ids}" ]]; then
+        DNS_NOTIFY_EVENT="skipped"
+        DNS_NOTIFY_SKIPPED=1
+        return 0
+    fi
+
+    msg="$(build_dns_change_message "${name}" "${target}" "${method}" "${port}" "${previous_updated}")"
+    send_to_target_notifiers "${notifier_ids}" "${msg}" || true
+
+    DNS_NOTIFY_EVENT="changed"
+    DNS_NOTIFY_SENT="${SEND_SENT:-0}"
+    DNS_NOTIFY_FAILED="${SEND_FAILED:-0}"
+    DNS_NOTIFY_SKIPPED="${SEND_SKIPPED:-0}"
+    [[ "${run_mode}" == "manual" ]] && print_send_result "[${name}] 解析变更"
+}
+
 handle_check_notification() {
     local target_id="$1"
     local name="$2"
@@ -1362,7 +1546,7 @@ accumulate_notify_result() {
 run_checks() {
     local run_mode="${1:-manual}"
     local id name target method port mode notifier_ids enabled created method_text
-    local total=0 alerts=0 recoveries=0 duplicates=0 sent_total=0 failed_total=0 skipped_total=0
+    local total=0 alerts=0 recoveries=0 dns_changes=0 duplicates=0 sent_total=0 failed_total=0 skipped_total=0
 
     ensure_data
     migrate_legacy_config
@@ -1379,6 +1563,16 @@ run_checks() {
         [[ "${run_mode}" == "manual" ]] && info "正在检测 [${name}] ${target} (${method_text})"
 
         check_one_target "${name}" "${target}" "${method}" "${port}" "${mode}"
+
+        handle_dns_change_notification "${id}" "${name}" "${target}" "${method}" "${port}" "${notifier_ids}" "${run_mode}"
+        if [[ "${DNS_NOTIFY_EVENT}" == "changed" ]]; then
+            dns_changes=$((dns_changes + 1))
+            sent_total=$((sent_total + ${DNS_NOTIFY_SENT:-0}))
+            failed_total=$((failed_total + ${DNS_NOTIFY_FAILED:-0}))
+            skipped_total=$((skipped_total + ${DNS_NOTIFY_SKIPPED:-0}))
+        elif [[ "${DNS_NOTIFY_EVENT}" == "skipped" ]]; then
+            skipped_total=$((skipped_total + ${DNS_NOTIFY_SKIPPED:-0}))
+        fi
 
         resolve_target_notifier_groups "${notifier_ids}" "${mode}"
         skipped_total=$((skipped_total + ${NOTIFIER_GROUP_SKIPPED:-0}))
@@ -1402,7 +1596,7 @@ run_checks() {
 
     if [[ "${run_mode}" == "manual" ]]; then
         echo
-        ok "巡检完成：启用目标 ${total} 个，触发告警 ${alerts} 个，恢复 ${recoveries} 个，重复跳过 ${duplicates} 个，通知成功 ${sent_total} 个，失败 ${failed_total} 个，跳过 ${skipped_total} 个。"
+        ok "巡检完成：启用目标 ${total} 个，触发告警 ${alerts} 个，恢复 ${recoveries} 个，解析变更 ${dns_changes} 个，重复跳过 ${duplicates} 个，通知成功 ${sent_total} 个，失败 ${failed_total} 个，跳过 ${skipped_total} 个。"
     fi
 }
 
@@ -1572,6 +1766,7 @@ run_one_target() {
         [[ "${enabled}" == "yes" ]] || warn "该目标当前是停用状态，本次仍会手动检测一次。"
         info "正在检测 [${name}] ${target} ($(method_label "${method}" "${port}"))"
         check_one_target "${name}" "${target}" "${method}" "${port}" "${mode}"
+        handle_dns_change_notification "${id}" "${name}" "${target}" "${method}" "${port}" "${notifier_ids}" "manual"
         resolve_target_notifier_groups "${notifier_ids}" "${mode}"
         LEGACY_STATE_STATUS=""
         LEGACY_STATE_SIGNATURE=""
